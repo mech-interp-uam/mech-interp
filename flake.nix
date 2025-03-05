@@ -19,6 +19,7 @@
           numpy
           pip
           ghp-import
+          notebook
         ]))
       ];
     };
