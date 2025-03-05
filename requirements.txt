@@ -19,6 +19,7 @@ docutils==0.21.2
 executing==2.1.0
 fastjsonschema==2.19.1
 fonttools==4.54.1
+ghp-import==2.1.0
 greenlet==3.1.1
 idna==3.10
 imagesize==1.4.1
