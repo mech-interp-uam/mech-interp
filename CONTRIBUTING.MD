@@ -7,7 +7,7 @@
  primero crea un branch nuevo, 
  Usa `git checkout -b nombre-del-branch`,
 
-##Cómo hacer un Pull Request
+## Cómo hacer un Pull Request
 1. Crea un branch para tus cambios.
 2. Haz commits con cambios de UN solo tema.
 3. Sube los cambios con `git push origin nombre-del-branch`.
