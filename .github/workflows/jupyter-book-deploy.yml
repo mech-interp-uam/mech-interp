@@ -4,9 +4,15 @@ on:
   push:
     branches:
       - master
+    # Only run when changes occur in the book/ folder
+    paths:
+      - "book/**"
   pull_request:
     branches:
       - master
+    # Only run on pull requests if files in the book/ folder were changed
+    paths:
+      - "book/**"
 
 jobs:
   deploy-book:
