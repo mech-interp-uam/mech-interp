@@ -9,3 +9,4 @@ chapters:
 - file: markdown-notebooks
 - file: mymarkdownfile
 - file: autoencoder-simple
+- file: Transformers
