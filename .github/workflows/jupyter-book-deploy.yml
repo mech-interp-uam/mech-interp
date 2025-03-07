@@ -1,0 +1,64 @@
+name: deploy-book
+
+on:
+  push:
+    branches:
+      - master
+    # Only run when changes occur in the book/ folder
+    paths:
+      - "book/**"
+  pull_request:
+    branches:
+      - master
+    # Only run on pull requests if files in the book/ folder were changed
+    paths:
+      - "book/**"
+
+jobs:
+  deploy-book:
+    if: >
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.base.ref == 'master' &&
+       (github.event.pull_request.author_association == 'OWNER' ||
+        github.event.pull_request.author_association == 'COLLABORATOR'))
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Install dependencies
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r book/requirements.txt
+
+      # (Optional) Cache your executed notebooks between runs
+      - name: cache executed notebooks
+        uses: actions/cache@v4
+        with:
+          path: book/_build/.jupyter_cache
+          key: jupyter-book-cache-${{ hashFiles('book/requirements.txt') }}
+
+      # Build the book
+      - name: Build the book
+        run: |
+          jupyter-book build book
+
+      # Upload the book's HTML as an artifact
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: "book/_build/html"
+
+      # Deploy to GitHub Pages only on push events
+      - name: Deploy to GitHub Pages
+        if: github.event_name == 'push'
+        id: deployment
+        uses: actions/deploy-pages@v4
