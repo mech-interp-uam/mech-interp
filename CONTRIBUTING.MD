@@ -17,7 +17,7 @@
 - Para compilar el libro, usa `jupyter-book build`.
 - Para ver los cambios, usa `jupyter-book serve`.
 
-## Uso de Git en la terBminal
+## Uso de Git en la terminal
 - Usa `git add -p` para agregar cambios selectivamente a staging.
 
 ## Despliegue automático del sitio
