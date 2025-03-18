@@ -10,3 +10,5 @@ chapters:
 - file: mymarkdownfile
 - file: autoencoder-simple
 - file: Transformers
+- file: expli_llama
+
