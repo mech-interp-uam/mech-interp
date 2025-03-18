@@ -9,3 +9,6 @@ chapters:
 - file: markdown-notebooks
 - file: mymarkdownfile
 - file: autoencoder-simple
+- file: autoencoder_transformer
+- file: expli_llama
+
