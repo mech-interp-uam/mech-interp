@@ -8,8 +8,10 @@ logo: mate_uam.png
 # Force re-execution of notebooks on each build.
 # See https://jupyterbook.org/content/execute.html
 execute:
-  execute_notebooks: force
-
+  execute_notebooks: force        # or auto / cache / inline – whatever you prefer
+  exclude_patterns:
+    - sae-plan-de-investigacion.ipynb
+    - transform_data.ipynb
 # Define the name of the latex output file for PDF builds
 latex:
   latex_documents:
