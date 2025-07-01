@@ -8,8 +8,10 @@ logo: mate_uam.png
 # Force re-execution of notebooks on each build.
 # See https://jupyterbook.org/content/execute.html
 execute:
-  execute_notebooks: force
-
+  execute_notebooks: force        # or auto / cache / inline – whatever you prefer
+  exclude_patterns:
+    - sae-plan-de-investigacion.ipynb
+    - transform_data.ipynb
 # Define the name of the latex output file for PDF builds
 latex:
   latex_documents:
@@ -21,7 +23,7 @@ bibtex_bibfiles:
 
 # Information about where the book exists on the web
 repository:
-  url: https://github.com/executablebooks/jupyter-book  # Online location of your book
+  url: https://github.com/mech-interp-and-rlhf/mech-interp  # Online location of your book
   path_to_book: docs  # Optional path to your book, relative to the repository root
   branch: master  # Which branch of the repository should be used when creating links (optional)
 
