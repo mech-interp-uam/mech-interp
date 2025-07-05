@@ -93,18 +93,20 @@
 
 import torch
 from torch import nn
-import jaxtyping
+from jaxtyping import Array, Float, Int
 import dataclasses
 from tqdm import tqdm
 from torch.nn import functional as F
 from torch.linalg import vector_norm
 import math
-import datasets
+from datasets import load_dataset
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import torch.profiler as prof 
 from contextlib import nullcontext
+import matplotlib.pyplot as plt
+
 
 # In[ ]:
 
@@ -167,10 +169,6 @@ class Sae(nn.Module):
 
     def forward(self,
         x,
-        return_mask=False,
-        return_prevalences = False,
-        return_l0=True,
-        return_reconstruction_loss=True,
     ):
         "We compute this much here so that compile() can do its magic"
         # as per train_gpt2.py on karpathy's llm.c repo, there are performance
@@ -183,18 +181,9 @@ class Sae(nn.Module):
         x = self.enc(x)
         threshold = torch.exp(self.log_threshold)
         s = Step.apply(x, threshold)
-        if return_mask:
-            d['mask'] = s
-        s = s.mean(0)
-        if return_prevalences:
-            d['prevalences'] = s
-        if return_l0:
-            d['l0'] = s.sum()
-        if not return_reconstruction_loss:
-            return d
         x = x*s
         x = self.dec(x)
-
+        d['mask'] = s
         d['reconstruction'] = ((x - original_input).pow(2)).mean(0).sum()
 
         return d
@@ -228,7 +217,6 @@ def sparsity_schedule(step, warmup_steps, max_sparsity_coeff):
 # In[ ]:
 
 
-from datasets import load_dataset
 
 # Load the dataset
 ds = load_dataset('mech-interp-uam/llama-mlp8-outputs')
@@ -245,29 +233,28 @@ print(f"First example shape: {ds['train'][0]['activations'].shape}")
 
 B = 1024
 n = 100
-sample_norms = (
-    ds['train']
-    .batch(B)
-    .shuffle()
-    .take(n)
-    .map(lambda row: {"norm": np.linalg.norm(row["activations"], axis=1).mean()},
-         remove_columns=['activations'])
-)
-norm = None
-for i, sample_norm in enumerate(sample_norms):
-    current_norm = sample_norm['norm']
-    if i == 0:
-        norm = current_norm
-        continue
-    norm = i/(i+1) * norm + 1/(i+1) * current_norm
-
-print(norm)
+# sample_norms = (
+#     ds['train']
+#     .batch(B)
+#     .shuffle()
+#     .take(n)
+#     .map(lambda row: {"norm": np.linalg.norm(row["activations"], axis=1).mean()},
+#          remove_columns=['activations'])
+# )
+# norm = None
+# for i, sample_norm in enumerate(sample_norms):
+#     current_norm = sample_norm['norm']
+#     if i == 0:
+#         norm = current_norm
+#         continue
+#     norm = i/(i+1) * norm + 1/(i+1) * current_norm
+# 
+# print(norm)
 
 
 # In[ ]:
 
 
-import torch
 
 class ActivationsDataset(Dataset):
     def __init__(self, hf_dataset):
@@ -293,7 +280,7 @@ dataloader = DataLoader(
     shuffle=True,
     num_workers=12,
     pin_memory=True,
-    prefetch_factor=32,
+    prefetch_factor=128,
     persistent_workers=True,
     drop_last=True,
 )
@@ -308,22 +295,31 @@ len(dataloader)
 # In[ ]:
 
 
-#torch.set_float32_matmul_precision('high')
+torch.set_float32_matmul_precision('high')
 steps = 2**16
 max_lr = 7e-5
 d_in = 2048
 d_sae = 2048*8
 model = Sae(d_in, d_sae)
 model.to(device)
-model.compile()
+model.compile(
+#         mode="max-autotune",
+#         dynamic=False,
+#         fullgraph=True,
+#         options = {
+#             "max_autotune":True,
+#             "epilogue_fusion":True,
+#             "triton.cudagraphs":True,
+#             },
+        )
 warmup_steps=1000
-sparcity_warmup_steps=256000
+sparcity_warmup_steps = 256000
 total_steps=256000 #for now
 optimizer = torch.optim.Adam([
     {"params": model.enc.parameters(), "lr":   max_lr, "betas":(0.0, 0.999)},
     {"params": model.dec.parameters(), "lr":   max_lr, "betas":(0.0, 0.999)},
-    {"params": model.log_threshold,    "lr": 2*max_lr, "betas":(0.99,0.999)},
-])
+    {"params": model.log_threshold,    "lr": 1*max_lr, "betas":(0.0, 0.999)},
+], fused=True)
 max_sparsity_coeff = 0.0009
 
 scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -331,20 +327,31 @@ scheduler = torch.optim.lr_scheduler.LambdaLR(
     lr_lambda=lambda step: cosine_schedule_with_warmup(step, warmup_steps, total_steps)
 )
 
-writer = SummaryWriter("/workspace/runs/sae")
+writer = SummaryWriter("/workspace/runs/sae-good-config-new-heatmap")
 
 should_break = False
 total_step = 0
 
 steps_per_tensorboard_log = 1
 prevalences_moving_average = 0.0
-prevalences_moving_average_batches = 10
+# we need to detect prevalences of at 1 every 10_000_000
+prevalences_moving_average_batches = 20000
 prevalences_moving_average_averaged = 0
-eval_prevalences_every = 100
+eval_prevalences_every = 500000
 
 bin_edges = np.logspace(np.log10(1e-8), np.log10(100), num=101).tolist()
 
-plot_activations = ... #TODO
+plot_features_every = 1000
+
+def heatmap_feature_products(features):
+    ...
+
+def feature_dimentionalities(features: Float[Array, "d_model d_sae"]) -> Float[Array, "d_sae"]:
+    # careful, this takes a lot of vram,
+    dot_products = features.T @ features
+    return dot_products.diag()/dot_products.norm(dim=0)
+
+cmap = plt.get_cmap("viridis")
 
 
 
@@ -364,42 +371,64 @@ with training_ctx:
             # you can do without the prevalences, use a rolling average for
             # mask that you clean once in a while and sent or do stuff when it
             # has averaged over enough steps
-            d = model(x, return_prevalences=True, return_mask=True)
-            reconstruction_loss, l0, prevalences, mask = d['reconstruction'], d['l0'], d['prevalences'], d['mask']
+            #with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            d = model(
+                    x,
+                    #return_prevalences=True,
+                    # # for accuracy, use prevalences to compute the sum of s outside autocast
+                    # return_l0=False,
+                    )
+            reconstruction_loss, mask = d['reconstruction'], d['mask']
+            prevalences = mask.mean(0)
+            l0 = prevalences.sum()
+            # l0 = active_latent_ratio * d_sae
 
             # compute the prevalence of each neuron
+            with torch.no_grad():
+                if total_step % eval_prevalences_every == 0:
+                    # use next prevalences_moving_average_batches steps to eval the
+                    # prevalences
 
-            if total_step % eval_prevalences_every == 0:
-                # use next prevalences_moving_average_batches steps to eval the
-                # prevalences
+                    # init
+                    evaluating_prevalences = True
+                    prevalences_moving_average = 0.0
+                    prevalences_moving_average_averaged = 0
 
-                # init
-                evaluating_prevalences = True
-                prevalences_moving_average = 0.0
-                prevalences_moving_average_averaged = 0
-
-            if evaluating_prevalences:
-                with torch.no_grad():
+                if evaluating_prevalences:
                     prevalences_moving_average = (
                         (1./(prevalences_moving_average_averaged+1)) * prevalences
                         +
                         (1. - 1/(prevalences_moving_average_averaged+1)) * prevalences_moving_average
                     )
-                prevalences_moving_average_averaged += 1
+                    prevalences_moving_average_averaged += 1
 
 
-                if prevalences_moving_average_averaged >= prevalences_moving_average_batches:
-                    evaluating_prevalences = False
-                    writer.add_histogram("prevalences", 100. * prevalences_moving_average, total_step,
-                            bins=bin_edges
-                            )
-                    writer.add_histogram("log10 prevalences", -torch.log10(prevalences_moving_average + 1e-8), total_step)
-                    # print(total_step)
+                    if prevalences_moving_average_averaged >= prevalences_moving_average_batches:
+                        evaluating_prevalences = False
+                        writer.add_histogram("prevalences", 100. * prevalences_moving_average, total_step,
+                                bins=bin_edges
+                                )
+                        writer.add_histogram("log10 prevalences", torch.log10(prevalences_moving_average + 1e-8), total_step)
+                        # print(total_step)
 
-                    with torch.no_grad():
-                        percent_dead = 100. * (prevalences_moving_average < 1e-8).to(dtype).mean()
+                        percent_dead = 100. * (prevalences_moving_average < 1e-7).to(dtype).mean()
                         # Should we need to call .detach().cpu().item()?
-                    writer.add_scalar("percent dead", percent_dead, total_step)
+                        writer.add_scalar("percent dead", percent_dead, total_step)
+
+                if total_step % plot_features_every == 0:
+                    to_plot = 256
+                    features = model.dec.weight
+                    dot_products = features.T @ features
+                    dimentionalities = dot_products.diag()/dot_products.norm(dim=0)
+                    dot_products = dot_products.fill_diagonal_(0)
+                    idx = torch.argsort(dimentionalities, descending=True)[:256]
+                    dot_products = dot_products[idx]
+                    dot_products = dot_products[:, idx]
+                    dot_products = dot_products / dot_products.max()
+                    dot_products = cmap(dot_products.detach().cpu().numpy())[...,:3]
+                    dot_products = torch.as_tensor(dot_products).permute(2 ,0 ,1)
+                    writer.add_image("dot products", dot_products, total_step)
+
 
 
 
@@ -422,7 +451,7 @@ with training_ctx:
             if (total_step % steps_per_tensorboard_log) == 0:
                 writer.add_scalar(
                         "Reconstruction loss/train",
-                        loss.item(),
+                        reconstruction_loss.item(),
                         total_step,)
                 writer.add_scalar("L0 loss/train",
                         l0.item(),
