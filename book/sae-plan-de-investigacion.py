@@ -110,7 +110,7 @@ from contextlib import nullcontext
 
 
 dtype = torch.float32
-device = "cuda" if torch.cuda.is_available else "cpu"
+device = "cuda" if torch.cuda.is_available() else "cpu"
 USE_PROFILER = False
 
 
@@ -314,7 +314,7 @@ max_lr = 7e-5
 d_in = 2048
 d_sae = 2048*8
 model = Sae(d_in, d_sae)
-model.to('cuda')
+model.to(device)
 model.compile()
 warmup_steps=1000
 sparcity_warmup_steps=256000
@@ -358,7 +358,7 @@ training_ctx = nullcontext() if not USE_PROFILER else prof.profile(
 with training_ctx:
     while total_step < total_steps:
         for step, x in enumerate(tqdm(dataloader)):
-            x = x.to("cuda", non_blocking=True).to(dtype)
+            x = x.to(device, non_blocking=True).to(dtype)
             x /= 3.4 # this is supposed to be the expected norm
             optimizer.zero_grad()
             # you can do without the prevalences, use a rolling average for
