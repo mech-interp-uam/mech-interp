@@ -129,11 +129,8 @@ class Step(torch.autograd.Function):
     def backward(ctx, grad_output):
         bandwidth = 0.001
         x, threshold = ctx.saved_tensors
-
-        grad_threshold = torch.where(
-            abs(F.relu(x) - threshold) < bandwidth/2,
-            -1.0/bandwidth, 0)
-        
+        mask = (abs(x - threshold) < bandwidth/2) & (x > 0)
+        grad_threshold = -1.0/bandwidth * mask.to(x.dtype)
         return torch.zeros_like(x), grad_threshold * grad_output
 
 
