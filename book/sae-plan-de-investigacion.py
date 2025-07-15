@@ -106,6 +106,9 @@ from torch.utils.tensorboard import SummaryWriter
 import torch.profiler as prof 
 from contextlib import nullcontext
 import matplotlib.pyplot as plt
+import time
+import threading
+from queue import Queue
 
 
 # In[ ]:
@@ -195,7 +198,7 @@ def cosine_schedule_with_warmup(
     total_steps: int
     ):
     if current_step < warmup_steps:
-        lr =  (1 + current_step) / warmup_steps
+        lr = 0.1 + 0.9 * (current_step / warmup_steps)
         return lr
     progress = (current_step - warmup_steps) / (total_steps - warmup_steps)
     lr =  0.5 * (1 + math.cos(math.pi * progress))
@@ -269,7 +272,7 @@ class ActivationsDataset(Dataset):
 # In[ ]:
 
 
-batch = 1024
+batch = 1024 * 8
 dataset = ActivationsDataset(ds['train'])
 dataloader = DataLoader(
     dataset,
@@ -324,12 +327,51 @@ scheduler = torch.optim.lr_scheduler.LambdaLR(
     lr_lambda=lambda step: cosine_schedule_with_warmup(step, warmup_steps, total_steps)
 )
 
-writer = SummaryWriter("/workspace/runs/sae-good-config-new-heatmap")
+run_name = "sae-good-config-new-heatmap"
+writer = SummaryWriter(f"runs/{run_name}")
+
+# Create histogram and scalar save queues and worker threads
+hist_queue = Queue()
+scalar_queue = Queue()
+
+def save_histogram_worker():
+    import os
+    os.makedirs(f"histograms/{run_name}", exist_ok=True)
+    while True:
+        data = hist_queue.get()
+        if data is None:
+            break
+        step, name, values = data
+        np.savez_compressed(f"histograms/{run_name}/{name}_{step}.npz", values=values.cpu().numpy())
+        hist_queue.task_done()
+
+def save_scalar_worker():
+    import os
+    import json
+    os.makedirs(f"scalars/{run_name}", exist_ok=True)
+    while True:
+        data = scalar_queue.get()
+        if data is None:
+            break
+        step, name, value = data
+        # Append to JSON lines file for efficient streaming
+        with open(f"scalars/{run_name}/{name}.jsonl", "a") as f:
+            json.dump({"step": step, "value": value}, f)
+            f.write("\n")
+        scalar_queue.task_done()
+
+# Start worker threads
+threading.Thread(target=save_histogram_worker, daemon=True).start()
+threading.Thread(target=save_scalar_worker, daemon=True).start()
 
 should_break = False
 total_step = 0
 
 steps_per_tensorboard_log = 1
+
+# Throughput tracking
+start_time = time.time()
+total_samples_processed = 0
 prevalences_moving_average = 0.0
 # we need to detect prevalences of at 1 every 10_000_000
 prevalences_moving_average_batches = 20000
@@ -338,7 +380,8 @@ eval_prevalences_every = 500000
 
 bin_edges = np.logspace(np.log10(1e-8), np.log10(100), num=101).tolist()
 
-plot_features_every = 1000
+plot_features_every = 0  # Set to 0 to disable expensive W^T @ W computation
+log_activations_every = 1000
 
 def heatmap_feature_products(features):
     ...
@@ -364,17 +407,21 @@ with training_ctx:
         for step, x in enumerate(tqdm(dataloader)):
             x = x.to(device, non_blocking=True).to(dtype)
             x /= 3.4 # this is supposed to be the expected norm
+            
+            # Track throughput
+            total_samples_processed += x.shape[0]
+            
             optimizer.zero_grad()
             # you can do without the prevalences, use a rolling average for
             # mask that you clean once in a while and sent or do stuff when it
             # has averaged over enough steps
-            #with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            d = model(
-                    x,
-                    #return_prevalences=True,
-                    # # for accuracy, use prevalences to compute the sum of s outside autocast
-                    # return_l0=False,
-                    )
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                d = model(
+                        x,
+                        #return_prevalences=True,
+                        # # for accuracy, use prevalences to compute the sum of s outside autocast
+                        # return_l0=False,
+                        )
             reconstruction_loss, mask = d['reconstruction'], d['mask']
             prevalences = mask.mean(0)
             l0 = prevalences.sum()
@@ -412,15 +459,29 @@ with training_ctx:
                         # Should we need to call .detach().cpu().item()?
                         writer.add_scalar("percent dead", percent_dead, total_step)
 
-                if total_step % plot_features_every == 0:
+                if total_step % log_activations_every == 0:
+                    with torch.no_grad():
+                        # Recompute forward pass for histograms
+                        orig_x = x
+                        if model.use_pre_enc_bias:
+                            x_enc_input = orig_x - model.dec.bias
+                        else:
+                            x_enc_input = orig_x
+                        enc_output = model.enc(x_enc_input)
+                        threshold = torch.exp(model.log_threshold)
+                        s = (enc_output > threshold).to(enc_output.dtype)
+                        latents = enc_output * s
+                        reconstruction = model.dec(latents)
+                        reconstruction_error = reconstruction - orig_x
+                        writer.add_histogram("reconstruction_error", reconstruction_error, total_step)
+                        # Save histogram data to numpy files
+                        hist_queue.put((total_step, "reconstruction_error", reconstruction_error))
+
+                if plot_features_every > 0 and total_step % plot_features_every == 0:
                     to_plot = 256
-                    features = model.dec.weight
+                    features = model.dec.weight[:, :256]  # Take first 256 features only
                     dot_products = features.T @ features
-                    dimentionalities = dot_products.diag()/dot_products.norm(dim=0)
                     dot_products = dot_products.fill_diagonal_(0)
-                    idx = torch.argsort(dimentionalities, descending=True)[:256]
-                    dot_products = dot_products[idx]
-                    dot_products = dot_products[:, idx]
                     dot_products = dot_products / dot_products.max()
                     dot_products = cmap(dot_products.detach().cpu().numpy())[...,:3]
                     dot_products = torch.as_tensor(dot_products).permute(2 ,0 ,1)
@@ -433,19 +494,37 @@ with training_ctx:
 
             sparsity_coefficient = sparsity_schedule(total_step, sparcity_warmup_steps, max_sparsity_coeff)
             loss = reconstruction_loss + sparsity_coefficient * l0
+            
+            # Register gradient hooks for logging
+            if total_step % log_activations_every == 0:
+                def log_grad_hook(name):
+                    def hook(grad):
+                        writer.add_histogram(f"grad_{name}", grad, total_step)
+                        hist_queue.put((total_step, f"grad_{name}", grad))
+                        return grad
+                    return hook
+                
+                model.enc.weight.register_hook(log_grad_hook("enc_weight"))
+                model.dec.weight.register_hook(log_grad_hook("dec_weight"))
+                model.log_threshold.register_hook(log_grad_hook("log_threshold"))
+            
             # log losses, compute stats, etc
             grad = loss.backward()
-            # norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
             # metrics
             if (total_step % 5000) == 0:
                 with torch.no_grad():
                     # print metrics
+                    elapsed_time = time.time() - start_time
+                    samples_per_second = total_samples_processed / elapsed_time
                     print(f"{total_step=}")
                     print(f"reconstruction={reconstruction_loss.item()}")
                     print(f"l0={l0.item()}")
-                    # print(f"norm={norm.item()}")
+                    print(f"grad_norm={grad_norm.item()}")
+                    print(f"samples_per_second={samples_per_second:.1f}")
                     print(f"{sparsity_coefficient=}")
             if (total_step % steps_per_tensorboard_log) == 0:
+                # Tensorboard logging
                 writer.add_scalar(
                         "Reconstruction loss/train",
                         reconstruction_loss.item(),
@@ -459,6 +538,22 @@ with training_ctx:
                 writer.add_scalar("sparsity coefficient",
                         sparsity_coefficient,
                         total_step)
+                writer.add_scalar("grad norm",
+                        grad_norm.item(),
+                        total_step)
+                elapsed_time = time.time() - start_time
+                samples_per_second = total_samples_processed / elapsed_time
+                writer.add_scalar("samples per second",
+                        samples_per_second,
+                        total_step)
+                
+                # Save scalars to files
+                scalar_queue.put((total_step, "reconstruction_loss", reconstruction_loss.item()))
+                scalar_queue.put((total_step, "l0_loss", l0.item()))
+                scalar_queue.put((total_step, "lr", scheduler.get_last_lr()[0]))
+                scalar_queue.put((total_step, "sparsity_coefficient", sparsity_coefficient))
+                scalar_queue.put((total_step, "grad_norm", grad_norm.item()))
+                scalar_queue.put((total_step, "samples_per_second", samples_per_second))
             optimizer.step()
             # TODO: sparsity_coefficient scheduler
             # print(scheduler.get_last_lr()[0])
