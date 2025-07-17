@@ -117,6 +117,7 @@ from queue import Queue
 dtype = torch.float16  # weights and inputs in fp16
 lower_dtype = torch.float8_e4m3fn  # for autocast operations
 device = "cuda" if torch.cuda.is_available() else "cpu"
+device_type = "cuda" if torch.cuda.is_available() else "cpu"
 USE_PROFILER = False
 
 # Scaling factors for fp8 mixed precision
@@ -129,7 +130,7 @@ x_scale_factor = math.sqrt(target_x_var / x_var)  # = sqrt(d_model)
 w_scale_factor = math.sqrt(d_sae)  # enc output gets scaled down by sqrt(d_sae)
 # Constant to bring per-entry variance of x*s back to 1
 # After enc(x): variance = d_model (from summing d_model independent products)
-c = 1.0 / d_model
+c = 1.0 / math.sqrt(d_model)
 
 
 # In[ ]:
@@ -157,23 +158,21 @@ class Step(torch.autograd.Function):
 
 
 class Sae(nn.Module):
-    def __init__(self, d_in, d_sae, use_pre_enc_bias=True, **kwargs):
+    def __init__(self, d_in, d_sae, use_pre_enc_bias=False, **kwargs):
         super().__init__(**kwargs)
         self.enc = nn.Linear(d_in, d_sae, dtype=dtype)
         self.dec = nn.Linear(d_sae, d_in, dtype=dtype)
         with torch.no_grad():
             # Create decoder weights (d_in, d_sae) with unit norm dictionary vectors
             # Each column represents a dictionary vector
-            dec_weights = torch.randn(d_in, d_sae, dtype=torch.float32)
-            # Normalize each dictionary vector (column) in fp32 to avoid underflows
-            dec_weights /= vector_norm(dec_weights, dim=1, keepdim=True, dtype=torch.float32)
-            self.dec.weight.copy_(dec_weights.to(dtype))
+            dec_weights = torch.randn(d_in, d_sae, dtype=dtype)
+            self.dec.weight.copy_(dec_weights)
             self.enc.weight.copy_(dec_weights.t().to(dtype))  # (d_sae, d_in)
             self.enc.bias.copy_(torch.zeros_like(self.enc.bias))
             self.dec.bias.copy_(torch.zeros_like(self.dec.bias))
         # Scale threshold by x_scale_factor * w_scale_factor to account for scaling changes
         self.log_threshold = nn.Parameter(
-            torch.log(torch.full((d_sae,), 0.001 * x_scale_factor * w_scale_factor, dtype=dtype)))
+            torch.log(torch.full((d_sae,), 0.001 * (x_scale_factor * w_scale_factor), dtype=dtype)))
         self.d_sae = d_sae  # Store for scaling calculations
         self.use_pre_enc_bias = use_pre_enc_bias
         def project_out_parallel_grad(dim, tensor):
@@ -197,27 +196,45 @@ class Sae(nn.Module):
         # reasons not to return stuff
         d = {}
         # Scale input to match the scale of the reconstructed output
-        # for proper L2^2 intuition (should be x_scale_factor * w_scale_factor^2 * c)
-        scaled_input = x * x_scale_factor * w_scale_factor**2 * c
+        # for proper L2^2 intuition (should be w_scale_factor^2 * c)
+        scaled_input = x * (w_scale_factor**2 * c)
         
         if self.use_pre_enc_bias:
             x = x - self.dec.bias
         
         # Use fp8 autocast for matrix multiplications
-        with torch.autocast(device_type="cuda", dtype=lower_dtype):
-            x = self.enc(x)
-            # Don't scale down - let x grow for reasonable fp16 values
-            threshold = torch.exp(self.log_threshold)
-            s = Step.apply(x, threshold)
-            x = x*s
-            x = x * c  # Scale down to get per-entry variance=1
-            x = self.dec(x)
+        #with torch.autocast(device_type=device_type, dtype=lower_dtype):
+        x = self.enc(x)
+        # Don't scale down - let x grow for reasonable fp16 values
+        print(f"enc output range: {x.min().item():.3f} to {x.max().item():.3f}, mean: {x.mean().item():.3f}")
+        threshold = torch.exp(self.log_threshold)
+        print(f"threshold range: {threshold.min().item():.3f} to {threshold.max().item():.3f}")
+        s = Step.apply(x, threshold)
+        x = x*s
+        x = x * c  # Scale down to get per-entry variance=1
+        x = self.dec(x)
         
         d['mask'] = s
-        # Use sum() instead of mean(), will scale down loss later with no_grad
-        d['reconstruction'] = ((x - scaled_input).pow(2)).sum()
+        d['reconstruction'] = (x.float() - scaled_input.float()).pow(2).mean(0).sum()
+        print("norms:")
+        print(x.float().pow(2).mean(0).sum())
+        print(scaled_input.float().pow(2).mean(0).sum())
 
         return d
+
+# multiplicative factors with respect to the fp32 run at various points in the
+# model:
+output_scale_factor = x_scale_factor * w_scale_factor**2 * c
+reconstruction_loss_scale_factor = (output_scale_factor) ** 2
+print(reconstruction_loss_scale_factor)
+# l0 is the same as the fp32 run, but not he proportion of it and that point in
+# the backwards where it merges
+
+# this does dot compensate for different grad scalers on the different paths
+# nor for the err vector saved on forward and used in backwards
+loss_merge_scale_factor = (x_scale_factor * w_scale_factor)
+
+
 
 
 # In[ ]:
@@ -333,16 +350,16 @@ d_in = 2048
 d_sae = 2048*8
 model = Sae(d_in, d_sae)
 model.to(device)
-model.compile(
-#         mode="max-autotune",
-#         dynamic=False,
-#         fullgraph=True,
-#         options = {
-#             "max_autotune":True,
-#             "epilogue_fusion":True,
-#             "triton.cudagraphs":True,
-#             },
-        )
+# model.compile(
+# #         mode="max-autotune",
+# #         dynamic=False,
+# #         fullgraph=True,
+# #         options = {
+# #             "max_autotune":True,
+# #             "epilogue_fusion":True,
+# #             "triton.cudagraphs":True,
+# #             },
+#         )
 warmup_steps=1000
 sparcity_warmup_steps = 256000
 total_steps=256000 #for now
@@ -455,19 +472,18 @@ with training_ctx:
                     # return_l0=False,
                     )
             # reconstruction: Raw L2^2 loss (large scale, used for backprop)
-            reconstruction, mask = d['reconstruction'], d['mask']
+            reconstruction_loss, mask = d['reconstruction'], d['mask']
+            # TODO: .mean() both dimentions then fix with grad scaler
+            l0 = mask.sum(1, dtype=torch.float32).mean()
+            print(l0)
+            print(reconstruction_loss)
+            import sys;sys.exit(1)
             
-            # user_facing_reconstruction: Scaled for display (interpretable range 0.02-0.4)
             with torch.no_grad():
-                # Using scaled_input with factor x_scale_factor * w_scale_factor^2 * c
-                # Squared error has scale (x_scale_factor * w_scale_factor^2 * c)^2
-                # Also divide by batch_size to get per-sample average (since we use sum() inside)
-                loss_scale_factor = (x_scale_factor * w_scale_factor ** 2 * c) ** 2
-                batch_size = x.shape[0]
-                user_facing_reconstruction = reconstruction / (loss_scale_factor * batch_size)
-            prevalences = mask.mean(0)
-            l0 = prevalences.sum()
-            # l0 = active_latent_ratio * d_sae
+                interpretable_reconstruction_loss = reconstruction_loss/reconstruction_loss_scale_factor 
+                interpretable_l0_loss             = l0
+            # prevalences = mask.mean(0)
+            # dissable prevalences for now so we can compute l0 a different way
 
             # compute the prevalence of each neuron
             with torch.no_grad():
@@ -480,7 +496,7 @@ with training_ctx:
                     prevalences_moving_average = 0.0
                     prevalences_moving_average_averaged = 0
 
-                if evaluating_prevalences:
+                if evaluating_prevalences and False:
                     prevalences_moving_average = (
                         (1./(prevalences_moving_average_averaged+1)) * prevalences
                         +
@@ -532,50 +548,67 @@ with training_ctx:
 
 
 
-            
+
 
             sparsity_coefficient = sparsity_schedule(total_step, sparcity_warmup_steps, max_sparsity_coeff)
-            loss = reconstruction + sparsity_coefficient * l0
-            
+
             # Manual gradient scaling for fp8 compatibility
-            # Original measurement: 0.02 to 0.4 was sum over d_model of per-entry variances
-            # Per-entry variance = (0.02 to 0.4) / d_model
-            # After scaling: reconstruction error scaled by x_scale * w_scale^2
-            # Per-entry variance becomes (x_scale * w_scale^2)^2 * (0.02 to 0.4) / d_model
-            # Gradient from loss.backward(): 2 * (reconstruction_error)
-            # Gradient variance = 4 * x_scale^2 * w_scale^4 * (0.02 to 0.4) / d_model
-            # We want grad_err std ≈ 1 for fp8 matmuls in backward
-            measured_error_range = 0.4  # use upper bound for safety
-            grad_var = 4 * x_scale_factor**2 * w_scale_factor**4 * measured_error_range / d_model
-            grad_scale = 1.0 / math.sqrt(grad_var)
-            # gradient_scaled_reconstruction: Scaled for fp8 gradient stability (grad_err std ≈ 1)
-            gradient_scaled_reconstruction = loss * grad_scale
-            
-            # Register gradient hooks for logging
-            if total_step % log_activations_every == 0:
-                def log_grad_hook(name):
-                    def hook(grad):
-                        writer.add_histogram(f"grad_{name}", grad, total_step)
-                        hist_queue.put((total_step, f"grad_{name}", grad))
-                        return grad
-                    return hook
-                
-                model.enc.weight.register_hook(log_grad_hook("enc_weight"))
-                model.dec.weight.register_hook(log_grad_hook("dec_weight"))
-                model.log_threshold.register_hook(log_grad_hook("log_threshold"))
+            # Goal: Make 2 * reconstruction_error have per-entry variance = 1 in backward pass,
+            # mirroring the forward where network input has similar variance
+            # Current reconstruction error scale: x_scale_factor * w_scale_factor^2 * c
+
+            # Initial reconstruction_loss on the fp32 code
+            measured_reconstruction_loss = 0.2
+            previous_error_per_entry_std = math.sqrt(measured_reconstruction_loss / d_model)
+
+            # on the forward, compared to the fp32 code, the error per element is scaled by:
+            #   error_per_entry_std = output_scale_factor * previous_error_per_entry_std
+            error_per_entry_std = output_scale_factor * previous_error_per_entry_std
+
+            # compute merge-scale factors at the decoder-join:
+            # G_recon_nograd = 2 * output_scale_factor * w_scale_factor
+            merge_scale_nograd = 2 * output_scale_factor * w_scale_factor
+
+            # we make grad_error's per-entry std = 1 by applying:
+            reconstruction_grad_scaler = 1 / (2 * error_per_entry_std)
+            # hence including manual grad scaling:
+            merge_scale = merge_scale_nograd * reconstruction_grad_scaler
+
+            # we compensate for the grad scaler and the new vector using during
+            # backwards by 
+            # TODO: does the division go that way?
+            l0_grad_scaler = reconstruction_grad_scaler * (error_per_entry_std / previous_error_per_entry_std)
+
+            loss_for_backwards = reconstruction_loss * reconstruction_grad_scaler + l0 * l0_grad_scaler
+
+            grad = loss_for_backwards.backward()
+            # # Register gradient hooks for logging
+            # if total_step % log_activations_every == 0:
+            #     def log_grad_hook(name):
+            #         def hook(grad):
+            #             writer.add_histogram(f"grad_{name}", grad, total_step)
+            #             hist_queue.put((total_step, f"grad_{name}", grad))
+            #             return grad
+            #         return hook
+            #     
+            #     model.enc.weight.register_hook(log_grad_hook("enc_weight"))
+            #     model.dec.weight.register_hook(log_grad_hook("dec_weight"))
+            #     model.log_threshold.register_hook(log_grad_hook("log_threshold"))
             
             # log losses, compute stats, etc
-            grad = gradient_scaled_reconstruction.backward()
+            # we keep the same proportion on the scales where the two backwards
+            # paths merge
             
-            # Unscale gradients after backward pass
-            # Note: As per the ADAM paper abstract, ADAM is invariant to diagonal scaling,
-            # meaning scaling each gradient element by a (possibly different for
-            # each gradient element) fixed-during-training constant. In our
-            # case it's the same scaling for all gradient elements for all
-            # time-steps, so this applies. We unscale for clarity.
-            for p in model.parameters():
-                if p.grad is not None:
-                    p.grad.data.div_(grad_scale)
+            # Commented out because we don't know how much to scale these by
+            # # Unscale gradients after backward pass
+            # # Note: As per the ADAM paper abstract, ADAM is invariant to diagonal scaling,
+            # # meaning scaling each gradient element by a (possibly different for
+            # # each gradient element) fixed-during-training constant. In our
+            # # case it's the same scaling for all gradient elements for all
+            # # time-steps, so this applies. We unscale for clarity.
+            # for p in model.parameters():
+            #     if p.grad is not None:
+            #         p.grad.data.div_(reconstruction_grad_scaler)
             
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
             # metrics
@@ -585,7 +618,7 @@ with training_ctx:
                     elapsed_time = time.time() - start_time
                     samples_per_second = total_samples_processed / elapsed_time
                     print(f"{total_step=}")
-                    print(f"reconstruction={user_facing_reconstruction.item()}")
+                    print(f"reconstruction={interpretable_reconstruction_loss.item()}")
                     print(f"l0={l0.item()}")
                     print(f"grad_norm={grad_norm.item()}")
                     print(f"samples_per_second={samples_per_second:.1f}")
@@ -594,7 +627,7 @@ with training_ctx:
                 # Tensorboard logging
                 writer.add_scalar(
                         "Reconstruction loss/train",
-                        user_facing_reconstruction.item(),
+                        interpretable_reconstruction_loss.item(),
                         total_step,)
                 writer.add_scalar("L0 loss/train",
                         l0.item(),
@@ -615,7 +648,7 @@ with training_ctx:
                         total_step)
                 
                 # Save scalars to files
-                scalar_queue.put((total_step, "reconstruction_loss", user_facing_reconstruction.item()))
+                scalar_queue.put((total_step, "reconstruction_loss", interpretable_reconstruction_loss.item()))
                 scalar_queue.put((total_step, "l0_loss", l0.item()))
                 scalar_queue.put((total_step, "lr", scheduler.get_last_lr()[0]))
                 scalar_queue.put((total_step, "sparsity_coefficient", sparsity_coefficient))
@@ -654,6 +687,5 @@ sae2.load_state_dict(model.state_dict())
 
 
 # In[ ]:
-
 
 
