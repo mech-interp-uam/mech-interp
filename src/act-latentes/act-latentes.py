@@ -45,7 +45,6 @@ print(f"   d_sae = {D_SAE:,}")
 print(f"B_ENC shape: {B_ENC.shape}, W_ENC shape: {W_ENC.shape}  ")
 BIAS_TOTAL: Float[Array, "d_sae"] = B_ENC - (B_DEC @ W_ENC.transpose(0, 1))
 
-D_SAE = W_ENC.shape[1]
 print(f"   d_sae = {D_SAE:,}")
 
 # ───── 3. Encoder funcional ───────────────────────────────────────────────── ───────────────────────────────────────────────────
