@@ -109,9 +109,9 @@ MODEL_NAME  = "gpt-4o-mini"
 MAX_NEURONS = 100
 TEMP        = 0.3
 
-os.environ["OPENAI_API_KEY"] = getpass.getpass("Pega tu clave: ")
-openai.api_key = os.getenv("OPENAI_API_KEY")
-
+api_key_test = getpass.getpass("Pega tu clave OpenAI para probar: ")
+openai.api_key = api_key_test
+print(f"Key loaded: {openai.api_key is not None}, Length: {len(openai.api_key) if openai.api_key else 'N/A'}")
 def create_prompt(nid: int, acts_idx: np.ndarray, acts_val: np.ndarray) -> str:
     pairs = "\n".join(f"• idx={i:7d}, act={v:>.3f}"
                        for i, v in zip(acts_idx, acts_val))
