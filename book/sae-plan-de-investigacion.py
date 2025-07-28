@@ -106,9 +106,8 @@ from torch.utils.tensorboard import SummaryWriter
 import torch.profiler as prof 
 from contextlib import nullcontext
 import matplotlib.pyplot as plt
-import time
-import threading
-from queue import Queue
+from math import sqrt
+import argparse
 
 
 # In[ ]:
@@ -116,7 +115,28 @@ from queue import Queue
 
 dtype = torch.float32
 device = "cuda" if torch.cuda.is_available() else "cpu"
-USE_PROFILER = False
+# Parse command line arguments
+parser = argparse.ArgumentParser()
+parser.add_argument('--use-d-model-std', action='store_true', 
+                    help='Use 1/sqrt(d_model) for weight std instead of 1/sqrt(d_sae)')
+parser.add_argument('--run-name', type=str, default="b4kwarmup2kdataworkers12bf16exp24",
+                    help='Name for the training run (used for logging directories)')
+parser.add_argument('--exp-factor', type=int, default=24,
+                    help='Expansion factor for d_sae = d_model * exp_factor')
+parser.add_argument('--sparsity-coeff', type=float, default=0.001,
+                    help='Maximum sparsity coefficient')
+parser.add_argument('--total-steps', type=int, default=256000,
+                    help='Total number of training steps')
+parser.add_argument('--sparsity-warmup-full', action='store_true',
+                    help='Use full training length for sparsity warmup instead of 100k steps')
+parser.add_argument('--max-lr', type=float, default=14e-5,
+                    help='Maximum learning rate')
+args = parser.parse_args()
+
+USE_PROFILER = True
+d_in = 2048
+d_sae = d_in * args.exp_factor
+w_std = 1/sqrt(d_in) if args.use_d_model_std else 1/sqrt(d_sae)
 
 
 # In[ ]:
@@ -145,10 +165,12 @@ class Sae(nn.Module):
         super().__init__(**kwargs)
         self.enc = nn.Linear(d_in, d_sae, dtype=dtype)
         self.dec = nn.Linear(d_sae, d_in, dtype=dtype)
+        w = torch.randn(d_in, d_sae)
+        w *= ((w_std * sqrt(d_in))/vector_norm(w, dim=0, keepdim=True))
         with torch.no_grad():
             # normalize each of the d_sae dictonary vectors
-            self.dec.weight /= vector_norm(self.dec.weight, dim=1, keepdim=True)
-            self.enc.weight.copy_(self.dec.weight.clone().t())
+            self.dec.weight.copy_(w.clone().to(dtype))
+            self.enc.weight.copy_(w.clone().to(dtype).t())
             self.enc.bias.copy_(torch.zeros_like(self.enc.bias))
             self.dec.bias.copy_(torch.zeros_like(self.dec.bias))
         self.log_threshold = nn.Parameter(
@@ -164,7 +186,7 @@ class Sae(nn.Module):
             return hook
 
         self.dec.weight.register_hook(
-            project_out_parallel_grad(1, self.dec.weight))
+            project_out_parallel_grad(0, self.dec.weight))
                 
 
     def forward(self,
@@ -198,7 +220,8 @@ def cosine_schedule_with_warmup(
     total_steps: int
     ):
     if current_step < warmup_steps:
-        lr = 0.1 + 0.9 * (current_step / warmup_steps)
+        # Linear warmup from 10% to 100%
+        lr = 0.1 + 0.9 * current_step / warmup_steps
         return lr
     progress = (current_step - warmup_steps) / (total_steps - warmup_steps)
     lr =  0.5 * (1 + math.cos(math.pi * progress))
@@ -218,20 +241,30 @@ def sparsity_schedule(step, warmup_steps, max_sparsity_coeff):
 
 
 
-# Load the dataset
-ds = load_dataset('mech-interp-uam/llama-mlp8-outputs')
-ds.set_format('numpy')
+# Load the dataset with all train_* splits
+from datasets import concatenate_datasets
+
+# Load all train_* splits
+dataset_dict = load_dataset('naraca/activaciones-llama3-mlp8')
+train_splits = [split for split in dataset_dict.keys() if split.startswith('train_')]
+print(f"Found {len(train_splits)} train splits: {train_splits[:5]}...")
+
+# Concatenate all train splits
+train_datasets = [dataset_dict[split] for split in train_splits]
+ds_train = concatenate_datasets(train_datasets)
+ds = {'train': ds_train}
+ds['train'].set_format('numpy')
 
 # Check the dataset structure
 print(f"Dataset loaded successfully: {len(ds['train'])} examples")
 print(f"Features: {ds['train'].features}")
-print(f"First example shape: {ds['train'][0]['activations'].shape}")
+print(f"First example length: {len(ds['train'][0]['activacion'])}")
 
 
 # In[ ]:
 
 
-B = 1024
+#B = 1024 * 4
 n = 100
 # sample_norms = (
 #     ds['train']
@@ -263,7 +296,11 @@ class ActivationsDataset(Dataset):
     def __getitem__(self, idx):
         # Return as float16, on modern GPUs conversion from float 16 to 32 is
         # free compared to matmults or so I was told
-        return torch.tensor(self.data[idx]['activations'])
+        # Convert from list to numpy array, then from uint16 to bfloat16
+        activations = self.data[idx]['activacion']
+        activations_np = np.array(activations, dtype=np.uint16)
+        activations_bf16 = torch.from_numpy(activations_np).view(torch.bfloat16)
+        return activations_bf16.float()
 
     def __len__(self):
         return len(self.data)
@@ -272,7 +309,7 @@ class ActivationsDataset(Dataset):
 # In[ ]:
 
 
-batch = 1024 * 8
+batch = 1024 * 4
 dataset = ActivationsDataset(ds['train'])
 dataloader = DataLoader(
     dataset,
@@ -281,7 +318,7 @@ dataloader = DataLoader(
     num_workers=12,
     pin_memory=True,
     prefetch_factor=128,
-    persistent_workers=True,
+    persistent_workers=False,
     drop_last=True,
 )
 
@@ -297,91 +334,59 @@ len(dataloader)
 
 torch.set_float32_matmul_precision('high')
 steps = 2**16
-max_lr = 7e-5
-d_in = 2048
-d_sae = 2048*8
+max_lr = args.max_lr
 model = Sae(d_in, d_sae)
 model.to(device)
 model.compile(
-#         mode="max-autotune",
-#         dynamic=False,
-#         fullgraph=True,
+        mode="max-autotune",
+        dynamic=False,
+        fullgraph=True,
 #         options = {
 #             "max_autotune":True,
 #             "epilogue_fusion":True,
 #             "triton.cudagraphs":True,
 #             },
         )
-warmup_steps=1000
-sparcity_warmup_steps = 256000
-total_steps=256000 #for now
+warmup_steps=2000
+sparcity_warmup_steps = args.total_steps if args.sparsity_warmup_full else 100000
+total_steps=args.total_steps
 optimizer = torch.optim.Adam([
     {"params": model.enc.parameters(), "lr":   max_lr, "betas":(0.0, 0.999)},
     {"params": model.dec.parameters(), "lr":   max_lr, "betas":(0.0, 0.999)},
     {"params": model.log_threshold,    "lr": 1*max_lr, "betas":(0.0, 0.999)},
 ], fused=True)
-max_sparsity_coeff = 0.0009
+max_sparsity_coeff = args.sparsity_coeff
 
 scheduler = torch.optim.lr_scheduler.LambdaLR(
     optimizer,
     lr_lambda=lambda step: cosine_schedule_with_warmup(step, warmup_steps, total_steps)
 )
 
-run_name = "sae-good-config-new-heatmap"
+run_name = args.run_name
 writer = SummaryWriter(f"runs/{run_name}")
 
-# Create histogram and scalar save queues and worker threads
-hist_queue = Queue()
-scalar_queue = Queue()
+# Create directory for external logging
+import os
+os.makedirs(f"runs/{run_name}/prevalences", exist_ok=True)
+os.makedirs(f"runs/{run_name}/checkpoints", exist_ok=True)
 
-def save_histogram_worker():
-    import os
-    os.makedirs(f"histograms/{run_name}", exist_ok=True)
-    while True:
-        data = hist_queue.get()
-        if data is None:
-            break
-        step, name, values = data
-        np.savez_compressed(f"histograms/{run_name}/{name}_{step}.npz", values=values.cpu().numpy())
-        hist_queue.task_done()
-
-def save_scalar_worker():
-    import os
-    import json
-    os.makedirs(f"scalars/{run_name}", exist_ok=True)
-    while True:
-        data = scalar_queue.get()
-        if data is None:
-            break
-        step, name, value = data
-        # Append to JSON lines file for efficient streaming
-        with open(f"scalars/{run_name}/{name}.jsonl", "a") as f:
-            json.dump({"step": step, "value": value}, f)
-            f.write("\n")
-        scalar_queue.task_done()
-
-# Start worker threads
-threading.Thread(target=save_histogram_worker, daemon=True).start()
-threading.Thread(target=save_scalar_worker, daemon=True).start()
 
 should_break = False
 total_step = 0
 
 steps_per_tensorboard_log = 1
-
-# Throughput tracking
-start_time = time.time()
-total_samples_processed = 0
 prevalences_moving_average = 0.0
 # we need to detect prevalences of at 1 every 10_000_000
-prevalences_moving_average_batches = 20000
+prevalences_moving_average_batches = 2000
 prevalences_moving_average_averaged = 0
-eval_prevalences_every = 500000
+eval_prevalences_every = 5000
 
 bin_edges = np.logspace(np.log10(1e-8), np.log10(100), num=101).tolist()
 
-plot_features_every = 0  # Set to 0 to disable expensive W^T @ W computation
-log_activations_every = 1000
+# Save bin edges once at start
+np.save(f"runs/{run_name}/prevalences/bin_edges.npy", np.array(bin_edges))
+
+plot_features_every = 1000
 
 def heatmap_feature_products(features):
     ...
@@ -395,22 +400,20 @@ cmap = plt.get_cmap("viridis")
 
 
 
-training_ctx = nullcontext() if not USE_PROFILER else prof.profile(
+profiler = prof.profile(
     schedule=prof.schedule(wait=1, warmup=1, active=3, repeat=2),
     on_trace_ready=prof.tensorboard_trace_handler("runs/prof"),
     record_shapes=True,
     with_flops=True,
     with_stack=True,
-    )
+    ) if USE_PROFILER else nullcontext()
+
+training_ctx = profiler if USE_PROFILER else nullcontext()
 with training_ctx:
     while total_step < total_steps:
         for step, x in enumerate(tqdm(dataloader)):
             x = x.to(device, non_blocking=True).to(dtype)
             x /= 3.4 # this is supposed to be the expected norm
-            
-            # Track throughput
-            total_samples_processed += x.shape[0]
-            
             optimizer.zero_grad()
             # you can do without the prevalences, use a rolling average for
             # mask that you clean once in a while and sent or do stuff when it
@@ -453,35 +456,29 @@ with training_ctx:
                                 bins=bin_edges
                                 )
                         writer.add_histogram("log10 prevalences", torch.log10(prevalences_moving_average + 1e-8), total_step)
+                        
+                        # Save raw prevalence data asynchronously
+                        prevalences_copy = prevalences_moving_average.detach().float().clone()
+                        import threading
+                        def save_prevalences():
+                            prevalences_cpu = prevalences_copy.cpu().numpy()
+                            np.save(f"runs/{run_name}/prevalences/step_{total_step}.npy", prevalences_cpu)
+                        threading.Thread(target=save_prevalences, daemon=True).start()
                         # print(total_step)
 
                         percent_dead = 100. * (prevalences_moving_average < 1e-7).to(dtype).mean()
                         # Should we need to call .detach().cpu().item()?
                         writer.add_scalar("percent dead", percent_dead, total_step)
 
-                if total_step % log_activations_every == 0:
-                    with torch.no_grad():
-                        # Recompute forward pass for histograms
-                        orig_x = x
-                        if model.use_pre_enc_bias:
-                            x_enc_input = orig_x - model.dec.bias
-                        else:
-                            x_enc_input = orig_x
-                        enc_output = model.enc(x_enc_input)
-                        threshold = torch.exp(model.log_threshold)
-                        s = (enc_output > threshold).to(enc_output.dtype)
-                        latents = enc_output * s
-                        reconstruction = model.dec(latents)
-                        reconstruction_error = reconstruction - orig_x
-                        writer.add_histogram("reconstruction_error", reconstruction_error, total_step)
-                        # Save histogram data to numpy files
-                        hist_queue.put((total_step, "reconstruction_error", reconstruction_error))
-
-                if plot_features_every > 0 and total_step % plot_features_every == 0:
+                if total_step % plot_features_every == 0:
                     to_plot = 256
-                    features = model.dec.weight[:, :256]  # Take first 256 features only
+                    features = model.dec.weight
                     dot_products = features.T @ features
+                    dimentionalities = dot_products.diag()/dot_products.norm(dim=0)
                     dot_products = dot_products.fill_diagonal_(0)
+                    idx = torch.argsort(dimentionalities, descending=True)[:256]
+                    dot_products = dot_products[idx]
+                    dot_products = dot_products[:, idx]
                     dot_products = dot_products / dot_products.max()
                     dot_products = cmap(dot_products.detach().cpu().numpy())[...,:3]
                     dot_products = torch.as_tensor(dot_products).permute(2 ,0 ,1)
@@ -494,43 +491,26 @@ with training_ctx:
 
             sparsity_coefficient = sparsity_schedule(total_step, sparcity_warmup_steps, max_sparsity_coeff)
             loss = reconstruction_loss + sparsity_coefficient * l0
-            
-            # Register gradient hooks for logging
-            if total_step % log_activations_every == 0:
-                def log_grad_hook(name):
-                    def hook(grad):
-                        writer.add_histogram(f"grad_{name}", grad, total_step)
-                        hist_queue.put((total_step, f"grad_{name}", grad))
-                        return grad
-                    return hook
-                
-                model.enc.weight.register_hook(log_grad_hook("enc_weight"))
-                model.dec.weight.register_hook(log_grad_hook("dec_weight"))
-                model.log_threshold.register_hook(log_grad_hook("log_threshold"))
-            
             # log losses, compute stats, etc
             grad = loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
+            # norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             # metrics
             if (total_step % 5000) == 0:
                 with torch.no_grad():
                     # print metrics
-                    elapsed_time = time.time() - start_time
-                    samples_per_second = total_samples_processed / elapsed_time
                     print(f"{total_step=}")
                     print(f"reconstruction={reconstruction_loss.item()}")
                     print(f"l0={l0.item()}")
-                    print(f"grad_norm={grad_norm.item()}")
-                    print(f"samples_per_second={samples_per_second:.1f}")
+                    # print(f"norm={norm.item()}")
                     print(f"{sparsity_coefficient=}")
             if (total_step % steps_per_tensorboard_log) == 0:
-                # Tensorboard logging
+                # Use .detach() to avoid GPU-CPU sync during training
                 writer.add_scalar(
                         "Reconstruction loss/train",
-                        reconstruction_loss.item(),
+                        reconstruction_loss.detach(),
                         total_step,)
                 writer.add_scalar("L0 loss/train",
-                        l0.item(),
+                        l0.detach(),
                         total_step)
                 writer.add_scalar("lr",
                         scheduler.get_last_lr()[0],
@@ -538,22 +518,6 @@ with training_ctx:
                 writer.add_scalar("sparsity coefficient",
                         sparsity_coefficient,
                         total_step)
-                writer.add_scalar("grad norm",
-                        grad_norm.item(),
-                        total_step)
-                elapsed_time = time.time() - start_time
-                samples_per_second = total_samples_processed / elapsed_time
-                writer.add_scalar("samples per second",
-                        samples_per_second,
-                        total_step)
-                
-                # Save scalars to files
-                scalar_queue.put((total_step, "reconstruction_loss", reconstruction_loss.item()))
-                scalar_queue.put((total_step, "l0_loss", l0.item()))
-                scalar_queue.put((total_step, "lr", scheduler.get_last_lr()[0]))
-                scalar_queue.put((total_step, "sparsity_coefficient", sparsity_coefficient))
-                scalar_queue.put((total_step, "grad_norm", grad_norm.item()))
-                scalar_queue.put((total_step, "samples_per_second", samples_per_second))
             optimizer.step()
             # TODO: sparsity_coefficient scheduler
             # print(scheduler.get_last_lr()[0])
@@ -561,9 +525,21 @@ with training_ctx:
 
             # normalize
             with torch.no_grad():
-                wdecnorm = vector_norm(model.dec.weight, dim=1, keepdim=True)
-                model.dec.weight /= wdecnorm
+                model.dec.weight *= ((w_std * sqrt(d_in))/vector_norm(model.dec.weight, dim=0, keepdim=True))
         # print(f"epoch loss: {loss.detach().item()}")
+            
+            # Profiler step
+            if USE_PROFILER:
+                profiler.step()
+            
+            # Save model checkpoint every 5000 steps after 40k steps (asynchronously)
+            if total_step % 5000 == 0 and total_step >= 40000:
+                import threading
+                def save_checkpoint():
+                    checkpoint_path = f"runs/{run_name}/checkpoints/step_{total_step}.pth"
+                    torch.save(model.state_dict(), checkpoint_path)
+                threading.Thread(target=save_checkpoint, daemon=True).start()
+                
             total_step +=1
             if total_step > total_steps:
                 should_break = True
@@ -576,7 +552,9 @@ with training_ctx:
 # In[ ]:
 
 
-torch.save(model.state_dict(), "/workspace/llama3.2-1b-sae/sae.pth")
+# Save model with run name to avoid overwriting
+os.makedirs("models", exist_ok=True)
+torch.save(model.state_dict(), f"models/sae_{run_name}.pth")
 
 
 # In[ ]:
