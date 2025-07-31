@@ -179,10 +179,11 @@ class Sae(nn.Module):
         def project_out_parallel_grad(dim, tensor):
             @torch.no_grad
             def hook(grad_in):
-                # norm along dim=dim of the tensor is assumed to be 1 as we
+                # norm along dim=dim of the tensor is assumed to be w_std * sqrt(d_in) as we
                 # are going to normalize it after every grad update
+                norm_factor = w_std * sqrt(d_in)
                 dot = (tensor * grad_in).sum(dim=dim, keepdim=True)
-                return grad_in - dot * tensor
+                return grad_in - dot * tensor / (norm_factor * norm_factor)
             return hook
 
         self.dec.weight.register_hook(
