@@ -351,16 +351,30 @@ model.compile(
 warmup_steps=2000
 sparcity_warmup_steps = args.total_steps if args.sparsity_warmup_full else 100000
 total_steps=args.total_steps
-optimizer = torch.optim.Adam([
-    {"params": model.enc.parameters(), "lr":   max_lr, "betas":(0.0, 0.999)},
-    {"params": model.dec.parameters(), "lr":   max_lr, "betas":(0.0, 0.999)},
-    {"params": model.log_threshold,    "lr": 1*max_lr, "betas":(0.0, 0.999)},
-], fused=True)
+beta2 = 0.999
+optimizer = torch.optim.RMSprop(
+    model.parameters(),
+    lr=max_lr,
+    alpha=beta2,
+    momentum=0.0,
+)
 max_sparsity_coeff = args.sparsity_coeff
+
+def adam_to_rms_correction(step: int) -> float:
+    """
+    Multiply the original schedule by sqrt(1 - beta2**t) to reproduce
+    Adam(beta1=0) behaviour with RMSProp.
+    NOTE: schedulers in PyTorch receive step starting from 0, but Adam’s
+    bias‐correction uses t starting from 1, hence (step + 1) below.
+    """
+    return math.sqrt(1.0 - beta2 ** (step + 1))
 
 scheduler = torch.optim.lr_scheduler.LambdaLR(
     optimizer,
-    lr_lambda=lambda step: cosine_schedule_with_warmup(step, warmup_steps, total_steps)
+    lr_lambda=lambda step: (
+        cosine_schedule_with_warmup(step, warmup_steps, total_steps)
+        * adam_to_rms_correction(step)
+    )
 )
 
 run_name = args.run_name
