@@ -138,6 +138,14 @@ d_in = 2048
 d_sae = d_in * args.exp_factor
 w_std = 1/sqrt(d_in) if args.use_d_model_std else 1/sqrt(d_sae)
 
+# these are measured from the data
+x_real_norm = 3.4
+x_real_std = sqrt(x_real_norm/d_in)
+
+# these are for numerical stability on lower presitions
+x_artificial_std = 1.
+# Yes, adam and RMSprop ignore diagonal scaling so one does not have to worry
+# about this affecting the gradient, but if not what would be appropiate here(?)
 
 # In[ ]:
 
@@ -150,7 +158,7 @@ class Step(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        bandwidth = 0.001
+        bandwidth = 0.001 * x_artificial_std / x_real_std
         x, threshold = ctx.saved_tensors
         mask = (abs(x - threshold) < bandwidth/2) & (x > 0)
         grad_threshold = -1.0/bandwidth * mask.to(x.dtype)
@@ -174,7 +182,7 @@ class Sae(nn.Module):
             self.enc.bias.copy_(torch.zeros_like(self.enc.bias))
             self.dec.bias.copy_(torch.zeros_like(self.dec.bias))
         self.log_threshold = nn.Parameter(
-            torch.log(torch.full((d_sae,), 0.001, dtype=dtype)))
+            torch.log(torch.full((d_sae,), 0.001 * x_artificial_std / x_real_std, dtype=dtype)))
         self.use_pre_enc_bias = use_pre_enc_bias
         def project_out_parallel_grad(dim, tensor):
             @torch.no_grad
@@ -428,7 +436,7 @@ with training_ctx:
     while total_step < total_steps:
         for step, x in enumerate(tqdm(dataloader)):
             x = x.to(device, non_blocking=True).to(dtype)
-            x /= 3.4 # this is supposed to be the expected norm
+            x *= x_artificial_std / x_real_std
             optimizer.zero_grad()
             # you can do without the prevalences, use a rolling average for
             # mask that you clean once in a while and sent or do stuff when it
@@ -441,6 +449,7 @@ with training_ctx:
                         # return_l0=False,
                         )
             reconstruction_loss, mask = d['reconstruction'], d['mask']
+            interpretable_reconstructions_loss = reconstruction_loss / (x_artificial_std / x_real_std)
             prevalences = mask.mean(0)
             l0 = prevalences.sum()
             # l0 = active_latent_ratio * d_sae
@@ -514,7 +523,7 @@ with training_ctx:
                 with torch.no_grad():
                     # print metrics
                     print(f"{total_step=}")
-                    print(f"reconstruction={reconstruction_loss.item()}")
+                    print(f"reconstruction={interpretable_reconstructions_loss.item()}")
                     print(f"l0={l0.item()}")
                     # print(f"norm={norm.item()}")
                     print(f"{sparsity_coefficient=}")
@@ -522,7 +531,7 @@ with training_ctx:
                 # Use .detach() to avoid GPU-CPU sync during training
                 writer.add_scalar(
                         "Reconstruction loss/train",
-                        reconstruction_loss.detach(),
+                        interpretable_reconstructions_loss.detach(),
                         total_step,)
                 writer.add_scalar("L0 loss/train",
                         l0.detach(),
