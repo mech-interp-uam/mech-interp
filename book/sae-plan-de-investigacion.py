@@ -364,7 +364,7 @@ optimizer = torch.optim.RMSprop(
     model.parameters(),
     lr=max_lr,
     alpha=beta2,
-    momentum=0.0,
+    centered=False,
 )
 max_sparsity_coeff = args.sparsity_coeff
 
