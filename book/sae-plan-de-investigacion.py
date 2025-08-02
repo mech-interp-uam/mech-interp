@@ -465,7 +465,7 @@ with training_ctx:
 
             # compute the prevalence of each neuron
             with torch.no_grad():
-                if total_step % eval_prevalences_every == 0:
+                if eval_prevalences_every > 0 and total_step % eval_prevalences_every == 0:
                     # use next prevalences_moving_average_batches steps to eval the
                     # prevalences
 
@@ -503,7 +503,7 @@ with training_ctx:
                         # Should we need to call .detach().cpu().item()?
                         writer.add_scalar("percent dead", percent_dead, total_step)
 
-                if total_step % plot_features_every == 0:
+                if plot_features_every > 0 and total_step % plot_features_every == 0:
                     to_plot = 256
                     features = model.dec.weight
                     dot_products = features.T @ features
@@ -536,7 +536,7 @@ with training_ctx:
                     print(f"l0={l0.item()}")
                     # print(f"norm={norm.item()}")
                     print(f"{sparsity_coefficient=}")
-            if (total_step % steps_per_tensorboard_log) == 0:
+            if steps_per_tensorboard_log > 0 and (total_step % steps_per_tensorboard_log) == 0:
                 # Use .detach() to avoid GPU-CPU sync during training
                 writer.add_scalar(
                         "Reconstruction loss/train",
