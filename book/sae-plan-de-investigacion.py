@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# # Entrenamiento de un SAE sobre las salidad y activaciones de la MLP intermedia de llama3.2 1B
+# # Entrenamiento de un SAE sobre las salidas y activaciones de la MLP intermedia de llama3.2 1B
 
 # ## Costo de entrenamiento
 # 
@@ -9,7 +9,7 @@
 # de sus MLPs (referencia a el seminario en una universidad de un ex empleado
 # de anthropic)
 # 
-# Una aprocimación simple del costo de entrenamiento de un modelo es
+# Una aproximación simple del costo de entrenamiento de un modelo es
 # 
 # $$
 #   6ND 
@@ -20,7 +20,7 @@
 # donde $N$ es el número de parámetros y $D$ la cantidad de muestras en el
 # conjunto de entrenamiento.
 # 
-# Esto se debe a que, generalmente, cada parámetro actua en una multiplicaciónl
+# Esto se debe a que, generalmente, cada parámetro actúa en una multiplicación
 # y en una suma de punto flotante, dandonos un costo de $2ND$ tan solo en el
 # forward pass. Tipicamente, el costo de el backward pass es el doble del forward
 # pass, haciendo que su costo sea $4ND$. Sumando tenemos el resultado previamente
@@ -55,7 +55,7 @@
 #   2 B
 # - Ajustamos una power law en base a 2 entrenamientos de SAEs más pequeñas,
 #   usando el mismo learning rate.
-# - Ajustamos una power law para el learning rate con los hiperparámetos optimos
+# - Ajustamos una power law para el learning rate con los hiperparámetros óptimos
 #   que estimó el paso anterior.
 # 
 # Si ignoramos la relación posicional de los tokens y asumimos una distribución
@@ -194,7 +194,7 @@ class Sae(nn.Module):
         w = torch.randn(d_model, d_sae)
         w *= ((w_std * sqrt(d_model))/vector_norm(w, dim=0, keepdim=True))
         with torch.no_grad():
-            # normalize each of the d_sae dictonary vectors
+            # normalize each of the d_sae dictionary vectors
             self.dec.weight.copy_(w.clone().to(dtype))
             self.enc.weight.copy_(w.clone().to(dtype).t())
             self.enc.bias.copy_(torch.zeros_like(self.enc.bias))
@@ -377,7 +377,7 @@ if args.compile_mode != 'none':
     #             },
             )
 warmup_steps=2000
-sparcity_warmup_steps = args.total_steps if args.sparsity_warmup_full else 100000
+sparsity_warmup_steps = args.total_steps if args.sparsity_warmup_full else 100000
 total_steps=args.total_steps
 optimizer = torch.optim.Adam([
     {"params": model.enc.parameters(), "lr":   max_lr, "betas":(0.0, 0.999)},
@@ -426,7 +426,7 @@ plot_features_every = 1000
 def heatmap_feature_products(features):
     ...
 
-def feature_dimentionalities(features: Float[Array, "d_model d_sae"]) -> Float[Array, "d_sae"]:
+def feature_dimensionalities(features: Float[Array, "d_model d_sae"]) -> Float[Array, "d_sae"]:
     # careful, this takes a lot of vram,
     dot_products = features.T @ features
     return dot_products.diag()/dot_products.norm(dim=0)
@@ -513,9 +513,9 @@ with training_ctx:
                     to_plot = 256
                     features = model.dec.weight
                     dot_products = features.T @ features
-                    dimentionalities = dot_products.diag()/dot_products.norm(dim=0)
+                    dimensionalities = dot_products.diag()/dot_products.norm(dim=0)
                     dot_products = dot_products.fill_diagonal_(0)
-                    idx = torch.argsort(dimentionalities, descending=True)[:256]
+                    idx = torch.argsort(dimensionalities, descending=True)[:256]
                     dot_products = dot_products[idx]
                     dot_products = dot_products[:, idx]
                     dot_products = dot_products / dot_products.max()
@@ -528,7 +528,7 @@ with training_ctx:
 
             
 
-            sparsity_coefficient = sparsity_schedule(total_step, sparcity_warmup_steps, max_sparsity_coeff)
+            sparsity_coefficient = sparsity_schedule(total_step, sparsity_warmup_steps, max_sparsity_coeff)
             loss = reconstruction_loss + sparsity_coefficient * l0
             # log losses, compute stats, etc
             grad = loss.backward()
