@@ -131,21 +131,88 @@ parser.add_argument('--sparsity-warmup-full', action='store_true',
                     help='Use full training length for sparsity warmup instead of 100k steps')
 parser.add_argument('--max-lr', type=float, default=14e-5,
                     help='Maximum learning rate')
+parser.add_argument('--autocast', type=str, default='bf16', choices=['bf16', 'fp16', 'none'],
+                    help='Autocast precision: bf16, fp16, or none (nullcontext)')
+parser.add_argument('--adam-trick', action='store_true', default=True,
+                    help='Use Adam trick for gradient scaling (default: True)')
+parser.add_argument('--fp16-run', action='store_true',
+                    help='Run almost purely in fp16 (incompatible with autocast)')
 args = parser.parse_args()
 
+# Validate incompatible options
+if args.fp16_run and args.autocast != 'none':
+    raise ValueError("--fp16-run is incompatible with --autocast. Use --autocast none with --fp16-run")
+
 USE_PROFILER = True
-d_in = 2048
-d_sae = d_in * args.exp_factor
-w_std = 1/sqrt(d_in) if args.use_d_model_std else 1/sqrt(d_sae)
+
+# Set up autocast context based on argument
+if args.autocast == 'bf16':
+    autocast_ctx = lambda: torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+elif args.autocast == 'fp16':
+    autocast_ctx = lambda: torch.autocast(device_type="cuda", dtype=torch.float16)
+else:  # args.autocast == 'none'
+    autocast_ctx = lambda: nullcontext()
+
+adam_trick = args.adam_trick
+
+# Set up dtypes for fp16 run
+if args.fp16_run:
+    dtype = torch.float32  # Keep parameters in fp32 for now
+    lower_dtype = torch.float16  # Convert to fp16 just before forward pass
+else:
+    dtype = torch.float32
+    lower_dtype = torch.float32
+
+d_model = 2048
+d_sae = d_model * args.exp_factor
+w_std = 1/sqrt(d_model) if args.use_d_model_std else 1/sqrt(d_sae)
 
 # these are measured from the data
 x_real_norm = 3.4
-x_real_std = sqrt(x_real_norm/d_in)
+
+x_real_std = sqrt(x_real_norm/d_model)
 
 # these are for numerical stability on lower presitions
 x_artificial_std = 1.
 # Yes, adam and RMSprop ignore diagonal scaling so one does not have to worry
 # about this affecting the gradient, but if not what would be appropiate here(?)
+
+w_real_std = w_std
+w_artificial_std = 1.
+
+# intention is to scale before next matmul to preserve input variance
+# c = 1 / sqrt(d_model * weight_per_entry_var)
+# where weight_per_entry_var = (w_artificial_std/w_real_std)^2 * w_std^2
+c = 1.0 / (sqrt(d_model) * (w_artificial_std/w_real_std) * w_std)
+
+# Adam trick scaling: make 2*error_vector have per-entry variance ≈ 1
+if adam_trick:
+    # Interpretable recons loss ≈ 0.1, so per-entry var ≈ 0.1/d_model
+    interpretable_per_entry_var = 0.1 / d_model
+    
+    # Linear scaling applied to error vector (not loss):
+    # Near initialization (close to identity), error vector scales linearly by:
+    # - Input scaling: x_artificial_std/x_real_std  
+    # - Encoder weight scaling: w_artificial_std/w_real_std
+    # - Middle scalar: c
+    # - Decoder weight scaling: w_artificial_std/w_real_std
+    total_error_linear_scaling = (
+        (x_artificial_std/x_real_std) * 
+        (w_artificial_std/w_real_std)**2 * 
+        c
+    )
+    
+    # Interpretable per-entry std of error vector
+    interpretable_per_entry_std = sqrt(interpretable_per_entry_var)
+    # Current per-entry std of scaled error vector  
+    current_per_entry_std = interpretable_per_entry_std * total_error_linear_scaling
+    # Scalar to make 2*error_vector have per-entry variance ≈ 1
+    # Target: var(2*error_vector) = 1
+    # var(2 * current_per_entry_std * sqrt(adam_trick_scalar)) = 1
+    # 4 * current_per_entry_std^2 * adam_trick_scalar = 1
+    adam_trick_scalar = 1.0 / (4 * current_per_entry_std**2)
+else:
+    adam_trick_scalar = 1.0
 
 # In[ ]:
 
@@ -161,7 +228,7 @@ class Step(torch.autograd.Function):
         bandwidth = 0.001 * x_artificial_std / x_real_std
         x, threshold = ctx.saved_tensors
         mask = (abs(x - threshold) < bandwidth/2) & (x > 0)
-        grad_threshold = -1.0/bandwidth * mask.to(x.dtype)
+        grad_threshold = ((-1.0/bandwidth) * (w_artificial_std/w_real_std)) * mask.to(x.dtype)
         return torch.zeros_like(x), grad_threshold * grad_output
 
 
@@ -169,12 +236,12 @@ class Step(torch.autograd.Function):
 
 
 class Sae(nn.Module):
-    def __init__(self, d_in, d_sae, use_pre_enc_bias=True, **kwargs):
+    def __init__(self, d_model, d_sae, use_pre_enc_bias=True, fp16_run=False, lower_dtype=torch.float32, **kwargs):
         super().__init__(**kwargs)
-        self.enc = nn.Linear(d_in, d_sae, dtype=dtype)
-        self.dec = nn.Linear(d_sae, d_in, dtype=dtype)
-        w = torch.randn(d_in, d_sae)
-        w *= ((w_std * sqrt(d_in))/vector_norm(w, dim=0, keepdim=True))
+        self.enc = nn.Linear(d_model, d_sae, dtype=dtype)
+        self.dec = nn.Linear(d_sae, d_model, dtype=dtype)
+        w = torch.randn(d_model, d_sae)
+        w *= (((w_std * sqrt(d_model))*(w_artificial_std/w_real_std))/vector_norm(w, dim=0, keepdim=True))
         with torch.no_grad():
             # normalize each of the d_sae dictonary vectors
             self.dec.weight.copy_(w.clone().to(dtype))
@@ -182,19 +249,30 @@ class Sae(nn.Module):
             self.enc.bias.copy_(torch.zeros_like(self.enc.bias))
             self.dec.bias.copy_(torch.zeros_like(self.dec.bias))
         self.log_threshold = nn.Parameter(
-            torch.log(torch.full((d_sae,), 0.001 * x_artificial_std / x_real_std, dtype=dtype)))
+            torch.log(
+                torch.full(
+                    (d_sae,),
+                    0.001 * (x_artificial_std/x_real_std) * (w_artificial_std/w_real_std),
+                    dtype=dtype)))
         self.use_pre_enc_bias = use_pre_enc_bias
         def project_out_parallel_grad(dim, tensor):
             @torch.no_grad
             def hook(grad_in):
-                # tensor has constant norm w_std * sqrt(d_in)
-                norm_sq = (w_std * sqrt(d_in))**2
+                # tensor has constant norm w_std * sqrt(d_model) * (w_artificial_std/w_real_std)
+                norm_sq = (w_std * sqrt(d_model) * (w_artificial_std/w_real_std))**2
                 dot = (tensor * grad_in).sum(dim=dim, keepdim=True)
                 return grad_in - (dot / norm_sq) * tensor
             return hook
 
         self.dec.weight.register_hook(
             project_out_parallel_grad(0, self.dec.weight))
+        
+        # Convert to fp16 for fp16 run
+        if fp16_run:
+            self.enc.weight.data = self.enc.weight.data.to(lower_dtype)
+            self.dec.weight.data = self.dec.weight.data.to(lower_dtype)
+            self.enc.bias.data = self.enc.bias.data.to(lower_dtype)
+            self.dec.bias.data = self.dec.bias.data.to(lower_dtype)
                 
 
     def forward(self,
@@ -204,7 +282,7 @@ class Sae(nn.Module):
         # as per train_gpt2.py on karpathy's llm.c repo, there are performance
         # reasons not to return stuff
         d = {}
-        original_input = x
+        scaled_input = x * ((w_real_std/w_artificial_std)**2*c)
         if self.use_pre_enc_bias:
             x = x - self.dec.bias
         
@@ -212,9 +290,11 @@ class Sae(nn.Module):
         threshold = torch.exp(self.log_threshold)
         s = Step.apply(x, threshold)
         x = x*s
+        # scale x before the following reduced-precision matmul
+        x *= c
         x = self.dec(x)
         d['mask'] = s
-        d['reconstruction'] = ((x - original_input).pow(2)).mean(0).sum()
+        d['reconstruction'] = ((x.float() - scaled_input.float()).pow(2)).mean(0).sum()
 
         return d
 
@@ -343,7 +423,7 @@ len(dataloader)
 torch.set_float32_matmul_precision('high')
 steps = 2**16
 max_lr = args.max_lr
-model = Sae(d_in, d_sae)
+model = Sae(d_model, d_sae, fp16_run=args.fp16_run, lower_dtype=lower_dtype)
 model.to(device)
 model.compile(
         mode="max-autotune",
@@ -436,11 +516,14 @@ with training_ctx:
         for step, x in enumerate(tqdm(dataloader)):
             x = x.to(device, non_blocking=True).to(dtype)
             x *= x_artificial_std / x_real_std
+            # Convert to lower precision just before model forward pass
+            if args.fp16_run:
+                x = x.to(lower_dtype)
             optimizer.zero_grad()
             # you can do without the prevalences, use a rolling average for
             # mask that you clean once in a while and sent or do stuff when it
             # has averaged over enough steps
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with autocast_ctx():
                 d = model(
                         x,
                         #return_prevalences=True,
@@ -448,9 +531,12 @@ with training_ctx:
                         # return_l0=False,
                         )
             reconstruction_loss, mask = d['reconstruction'], d['mask']
-            interpretable_reconstructions_loss = reconstruction_loss / (x_artificial_std / x_real_std)
+            interpretable_reconstructions_loss = reconstruction_loss / (
+                (x_artificial_std/x_real_std)
+                *((w_artificial_std/x_artificial_std)**2*c)
+            )
             prevalences = mask.mean(0)
-            l0 = prevalences.sum()
+            l0 = prevalences.float().sum() if args.fp16_run else prevalences.sum()
             # l0 = active_latent_ratio * d_sae
 
             # compute the prevalence of each neuron
@@ -513,7 +599,7 @@ with training_ctx:
             
 
             sparsity_coefficient = sparsity_schedule(total_step, sparcity_warmup_steps, max_sparsity_coeff)
-            loss = reconstruction_loss + sparsity_coefficient * l0
+            loss = (reconstruction_loss + sparsity_coefficient * l0) * adam_trick_scalar
             # log losses, compute stats, etc
             grad = loss.backward()
             # norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -548,7 +634,7 @@ with training_ctx:
 
             # normalize
             with torch.no_grad():
-                model.dec.weight *= ((w_std * sqrt(d_in))/vector_norm(model.dec.weight, dim=0, keepdim=True))
+                model.dec.weight *= ((w_std * sqrt(d_model)*(w_artificial_std/w_real_std))/vector_norm(model.dec.weight, dim=0, keepdim=True))
         # print(f"epoch loss: {loss.detach().item()}")
             
             # Profiler step
@@ -583,7 +669,7 @@ torch.save(model.state_dict(), f"models/sae_{run_name}.pth")
 # In[ ]:
 
 
-sae2 = Sae(d_in, d_sae)
+sae2 = Sae(d_model, d_sae, fp16_run=args.fp16_run, lower_dtype=lower_dtype)
 sae2.load_state_dict(model.state_dict())
 
 
