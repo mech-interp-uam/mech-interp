@@ -158,9 +158,9 @@ if args.deterministic:
     torch.use_deterministic_algorithms(True)
 
 USE_PROFILER = True
-d_in = 2048
-d_sae = d_in * args.exp_factor
-w_std = 1/sqrt(d_in) if args.use_d_model_std else 1/sqrt(d_sae)
+d_model = 2048
+d_sae = d_model * args.exp_factor
+w_std = 1/sqrt(d_model) if args.use_d_model_std else 1/sqrt(d_sae)
 
 
 # In[ ]:
@@ -185,12 +185,12 @@ class Step(torch.autograd.Function):
 
 
 class Sae(nn.Module):
-    def __init__(self, d_in, d_sae, use_pre_enc_bias=True, **kwargs):
+    def __init__(self, d_model, d_sae, use_pre_enc_bias=True, **kwargs):
         super().__init__(**kwargs)
-        self.enc = nn.Linear(d_in, d_sae, dtype=dtype)
-        self.dec = nn.Linear(d_sae, d_in, dtype=dtype)
-        w = torch.randn(d_in, d_sae)
-        w *= ((w_std * sqrt(d_in))/vector_norm(w, dim=0, keepdim=True))
+        self.enc = nn.Linear(d_model, d_sae, dtype=dtype)
+        self.dec = nn.Linear(d_sae, d_model, dtype=dtype)
+        w = torch.randn(d_model, d_sae)
+        w *= ((w_std * sqrt(d_model))/vector_norm(w, dim=0, keepdim=True))
         with torch.no_grad():
             # normalize each of the d_sae dictonary vectors
             self.dec.weight.copy_(w.clone().to(dtype))
@@ -203,9 +203,9 @@ class Sae(nn.Module):
         def project_out_parallel_grad(dim, tensor):
             @torch.no_grad
             def hook(grad_in):
-                # norm along dim=dim of the tensor is assumed to be w_std * sqrt(d_in) as we
+                # norm along dim=dim of the tensor is assumed to be w_std * sqrt(d_model) as we
                 # are going to normalize it after every grad update
-                norm_factor = w_std * sqrt(d_in)
+                norm_factor = w_std * sqrt(d_model)
                 dot = (tensor * grad_in).sum(dim=dim, keepdim=True)
                 return grad_in - dot * tensor / (norm_factor * norm_factor)
             return hook
@@ -360,7 +360,7 @@ len(dataloader)
 torch.set_float32_matmul_precision('high')
 steps = 2**16
 max_lr = args.max_lr
-model = Sae(d_in, d_sae)
+model = Sae(d_model, d_sae)
 model.to(device)
 # Apply compile mode based on CLI argument
 if args.compile_mode != 'none':
@@ -558,7 +558,7 @@ with training_ctx:
 
             # normalize
             with torch.no_grad():
-                model.dec.weight *= ((w_std * sqrt(d_in))/vector_norm(model.dec.weight, dim=0, keepdim=True))
+                model.dec.weight *= ((w_std * sqrt(d_model))/vector_norm(model.dec.weight, dim=0, keepdim=True))
         # print(f"epoch loss: {loss.detach().item()}")
             
             # Profiler step
@@ -606,7 +606,7 @@ torch.save(model.state_dict(), f"models/sae_{run_name}.pth")
 # In[ ]:
 
 
-sae2 = Sae(d_in, d_sae)
+sae2 = Sae(d_model, d_sae)
 sae2.load_state_dict(model.state_dict())
 
 
