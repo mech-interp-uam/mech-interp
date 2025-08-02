@@ -537,13 +537,13 @@ with training_ctx:
                     # print(f"norm={norm.item()}")
                     print(f"{sparsity_coefficient=}")
             if steps_per_tensorboard_log > 0 and total_step % steps_per_tensorboard_log == 0:
-                # Use .detach() to avoid GPU-CPU sync during training
+                # Do not use .item() nor .cpu() to avoid GPU-CPU sync during training
                 writer.add_scalar(
                         "Reconstruction loss/train",
-                        reconstruction_loss.detach(),
+                        reconstruction_loss,
                         total_step,)
                 writer.add_scalar("L0 loss/train",
-                        l0.detach(),
+                        l0,
                         total_step)
                 writer.add_scalar("lr",
                         scheduler.get_last_lr()[0],
