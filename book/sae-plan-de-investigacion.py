@@ -528,7 +528,7 @@ with training_ctx:
             grad = loss.backward()
             # norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             # metrics
-            if (total_step % 5000) == 0:
+            if total_step % 5000 == 0:
                 with torch.no_grad():
                     # print metrics
                     print(f"{total_step=}")
@@ -536,7 +536,7 @@ with training_ctx:
                     print(f"l0={l0.item()}")
                     # print(f"norm={norm.item()}")
                     print(f"{sparsity_coefficient=}")
-            if steps_per_tensorboard_log > 0 and (total_step % steps_per_tensorboard_log) == 0:
+            if steps_per_tensorboard_log > 0 and total_step % steps_per_tensorboard_log == 0:
                 # Use .detach() to avoid GPU-CPU sync during training
                 writer.add_scalar(
                         "Reconstruction loss/train",
