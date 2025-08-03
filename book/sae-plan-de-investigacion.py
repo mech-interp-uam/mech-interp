@@ -145,18 +145,18 @@ parser.add_argument('--optimizer', type=str, default='adam',
                     choices=['adam', 'rmsprop'],
                     help='Optimizer choice: adam or rmsprop (rmsprop reproduces Adam beta1=0)')
 parser.add_argument('--dtype', type=str, default='fp32', 
-                    choices=['fp32', 'fp16'],
-                    help='Parameter dtype: fp32 or fp16')
+                    choices=['fp32', 'fp16', 'bf16'],
+                    help='Parameter dtype: fp32, fp16, or bf16')
 parser.add_argument('--lower-dtype', type=str, default='fp32',
                     choices=['fp32', 'bf16', 'fp16'], 
                     help='Computation dtype: fp32, bf16, or fp16')
 args = parser.parse_args()
 
-# Validate dtype combinations
-if args.dtype == 'fp16' and args.lower_dtype not in ['fp16']:
-    raise ValueError("fp16 params only support fp16 lower_dtype")
-if args.lower_dtype == 'fp16' and args.dtype not in ['fp32', 'fp16']:
-    raise ValueError("fp16 lower_dtype requires fp32 or fp16 params")
+# Validate dtype combinations - only allow supported combinations
+supported_combinations = {('fp32', 'fp32'), ('fp32', 'bf16'), ('fp16', 'fp16'), ('bf16', 'bf16'), ('fp32', 'fp16')}
+if (args.dtype, args.lower_dtype) not in supported_combinations:
+    raise ValueError(f"Unsupported dtype combination: ({args.dtype}, {args.lower_dtype}). "
+                    f"Supported combinations: {sorted(supported_combinations)}")
 
 # Set random seed for reproducibility
 torch.manual_seed(args.seed)
