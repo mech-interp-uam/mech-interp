@@ -180,6 +180,55 @@ class Step(torch.autograd.Function):
         grad_threshold = -1.0/bandwidth * mask.to(x.dtype)
         return None, grad_threshold * grad_output
 
+class JumpReLU(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, threshold):
+        # output and mask
+        mask_x = x > threshold
+        out = torch.where(mask_x, x, torch.zeros((), dtype=x.dtype, device=x.device))
+
+        # mask is an auxiliary (non-differentiable) output
+        ctx.mark_non_differentiable(mask_x)
+
+        # save only if any grad is needed; don't materialize zero grads
+        if x.requires_grad or threshold.requires_grad:
+            ctx.save_for_backward(x, threshold)
+            ctx.set_materialize_grads(False)
+
+        return out, mask_x
+
+    @staticmethod
+    def backward(ctx, grad_out, _grad_out_mask_unused):
+        # nothing saved => no grads needed
+        if len(ctx.saved_tensors) == 0:
+            return None, None
+
+        x, threshold = ctx.saved_tensors
+
+        # grad w.r.t. x: indicator(x > threshold) * grad_out
+        if ctx.needs_input_grad[0]:
+            mask_x = x > threshold
+            grad_x = torch.where(
+                mask_x, grad_out,
+                torch.zeros((), dtype=grad_out.dtype, device=grad_out.device)
+            )
+        else:
+            grad_x = None
+
+        # grad w.r.t. threshold: band-limited spike around the jump
+        if ctx.needs_input_grad[1]:
+            half_bw = 5e-4   # 0.001 / 2
+            inv_bw  = 1e3    # 1 / 0.001
+            mask_thr = (x > 0) & ((x - threshold).abs() < half_bw)
+            grad_threshold = torch.where(
+                mask_thr, grad_out,
+                torch.zeros((), dtype=grad_out.dtype, device=grad_out.device)
+            ).mul_(-inv_bw)
+        else:
+            grad_threshold = None
+
+        return grad_x, grad_threshold
+
 
 # In[ ]:
 
@@ -227,8 +276,7 @@ class Sae(nn.Module):
         
         x = self.enc(x)
         threshold = torch.exp(self.log_threshold)
-        s = Step.apply(x, threshold)
-        x = x*s
+        x, s = JumpReLU.apply(x, threshold)
         x = self.dec(x)
         d['mask'] = s
         d['reconstruction'] = ((x - original_input).pow(2)).mean(0).sum()
@@ -463,7 +511,7 @@ with training_ctx:
                         # return_l0=False,
                         )
             reconstruction_loss, mask = d['reconstruction'], d['mask']
-            prevalences = mask.mean(0)
+            prevalences = mask.float().mean(0)
             l0 = prevalences.sum()
             # l0 = active_latent_ratio * d_sae
 
