@@ -339,7 +339,7 @@ class Sae(nn.Module):
             d['mask'] = s  # Keep as boolean
         
         x = self.dec(x)
-        d['reconstruction'] = ((x - original_input).pow(2)).mean(0).sum()
+        d['reconstruction'] = ((x.float() - original_input.float()).pow(2)).mean(0).sum()
 
         return d
 
