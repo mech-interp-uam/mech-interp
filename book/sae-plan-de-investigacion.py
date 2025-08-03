@@ -187,6 +187,14 @@ dtype_map = {
 dtype = dtype_map[args.dtype]
 lower_dtype = dtype_map[args.lower_dtype]
 
+# Set up autocast context based on dtype combination
+if args.dtype == 'fp32' and args.lower_dtype in ['fp16', 'bf16']:
+    # Mixed precision: fp32 params, autocast matmuls to lower_dtype
+    autocast_ctx = lambda: torch.autocast(device_type="cuda", dtype=lower_dtype)
+else:
+    # Same precision: (fp32,fp32), (fp16,fp16), (bf16,bf16) - no autocast needed
+    autocast_ctx = lambda: nullcontext()
+
 d_model = 2048
 d_sae = d_model * args.exp_factor
 w_std = 1/sqrt(d_model) if args.use_d_model_std else 1/sqrt(d_sae)
@@ -268,7 +276,8 @@ class Sae(nn.Module):
         super().__init__(**kwargs)
         self.enc = nn.Linear(d_model, d_sae, dtype=dtype)
         self.dec = nn.Linear(d_sae, d_model, dtype=dtype)
-        w = torch.randn(d_model, d_sae)
+        # Create and manipulate tensors in fp32
+        w = torch.randn(d_model, d_sae, dtype=torch.float32)
         w *= ((w_std * sqrt(d_model))/vector_norm(w, dim=0, keepdim=True))
         with torch.no_grad():
             # normalize each of the d_sae dictionary vectors
@@ -277,7 +286,7 @@ class Sae(nn.Module):
             self.enc.bias.copy_(torch.zeros_like(self.enc.bias))
             self.dec.bias.copy_(torch.zeros_like(self.dec.bias))
         self.log_threshold = nn.Parameter(
-            torch.log(torch.full((d_sae,), 0.001, dtype=dtype)))
+            torch.log(torch.full((d_sae,), 0.001, dtype=torch.float32)).to(dtype))
         self.use_pre_enc_bias = use_pre_enc_bias
         
         # Set activation function (do string comparison once in init)
@@ -585,7 +594,7 @@ with training_ctx:
             # you can do without the prevalences, use a rolling average for
             # mask that you clean once in a while and sent or do stuff when it
             # has averaged over enough steps
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with autocast_ctx():
                 d = model(
                         x,
                         #return_prevalences=True,
