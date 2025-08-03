@@ -199,6 +199,15 @@ d_model = 2048
 d_sae = d_model * args.exp_factor
 w_std = 1/sqrt(d_model) if args.use_d_model_std else 1/sqrt(d_sae)
 
+# these are measured from the data
+x_real_norm = 3.4
+x_real_std = sqrt(x_real_norm/d_model)
+
+# these are for numerical stability on lower precisions
+x_artificial_std = 1.
+# Input scaling factor: normalize input to have per-entry variance ≈ 1
+# for optimal fp16/fp8 range utilization
+
 
 # In[ ]:
 
@@ -214,7 +223,7 @@ def common_fused_forward(ctx, x, threshold):
 def make_backward_function(use_x_for_grad, returns_tuple=False):
     if returns_tuple:
         def backward_fn(ctx, grad_output, grad_mask_unused):
-            bandwidth = 0.001
+            bandwidth = 0.001 * (x_artificial_std/x_real_std) * x_real_norm
             x, threshold = ctx.saved_tensors
             mask = (abs(x - threshold) < bandwidth/2) & (x > 0)
             
@@ -228,7 +237,7 @@ def make_backward_function(use_x_for_grad, returns_tuple=False):
             return torch.zeros_like(x), grad_threshold * grad_output
     else:
         def backward_fn(ctx, grad_output):
-            bandwidth = 0.001
+            bandwidth = 0.001 * (x_artificial_std/x_real_std) * x_real_norm
             x, threshold = ctx.saved_tensors
             mask = (abs(x - threshold) < bandwidth/2) & (x > 0)
             
@@ -286,7 +295,7 @@ class Sae(nn.Module):
             self.enc.bias.copy_(torch.zeros_like(self.enc.bias))
             self.dec.bias.copy_(torch.zeros_like(self.dec.bias))
         self.log_threshold = nn.Parameter(
-            torch.log(torch.full((d_sae,), 0.001, dtype=torch.float32)).to(dtype))
+            torch.log(torch.full((d_sae,), 0.001 * (x_artificial_std/x_real_std) * x_real_norm, dtype=torch.float32)).to(dtype))
         self.use_pre_enc_bias = use_pre_enc_bias
         
         # Set activation function (do string comparison once in init)
@@ -587,7 +596,7 @@ with training_ctx:
         epoch_start_time = time.time()
         for step, x in enumerate(tqdm(dataloader)):
             x = x.to(device, non_blocking=True).to(dtype)
-            x /= 3.4 # this is supposed to be the expected norm
+            x *= x_artificial_std / x_real_std
             # Clear gradients manually instead of optimizer.zero_grad()
             for param in model.parameters():
                 param.grad = None
@@ -602,6 +611,11 @@ with training_ctx:
                         # return_l0=False,
                         )
             reconstruction_loss, mask = d['reconstruction'], d['mask']
+            # Create interpretable loss that undoes the L2^2 scaling effect
+            interpretable_reconstructions_loss = reconstruction_loss / (
+                (x_artificial_std/x_real_std)**2 *
+                x_real_norm**2
+            )
             if mask.dtype == torch.bool:
                 prevalences = mask.float().mean(0)
             else:
@@ -611,9 +625,7 @@ with training_ctx:
 
             sparsity_coefficient = sparsity_schedule(total_step, sparsity_warmup_steps, max_sparsity_coeff)
             
-            loss = reconstruction_loss + sparsity_coefficient * l0
-            # log losses, compute stats, etc
-            grad = loss.backward()
+            (reconstruction_loss + (sparsity_coefficient * x_real_norm) * l0).backward()
 
             # All logging in one no_grad block
             with torch.no_grad():
@@ -671,13 +683,13 @@ with training_ctx:
                 # Console metrics printing
                 if total_step % 5000 == 0:
                     print(f"{total_step=}")
-                    print(f"reconstruction={reconstruction_loss.item()}")
+                    print(f"reconstruction={interpretable_reconstructions_loss.item()}")
                     print(f"l0={l0.item()}")
                     print(f"{sparsity_coefficient=}")
 
                 # TensorBoard scalar logging
                 if steps_per_tensorboard_log > 0 and total_step % steps_per_tensorboard_log == 0:
-                    writer.add_scalar("Reconstruction loss/train", reconstruction_loss, total_step)
+                    writer.add_scalar("Reconstruction loss/train", interpretable_reconstructions_loss, total_step)
                     writer.add_scalar("L0 loss/train", l0, total_step)
                     writer.add_scalar("lr", scheduler.get_last_lr()[0], total_step)
                     writer.add_scalar("sparsity coefficient", sparsity_coefficient, total_step)
