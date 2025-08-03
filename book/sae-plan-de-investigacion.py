@@ -469,8 +469,11 @@ with training_ctx:
             l0 = prevalences.sum()
             # l0 = active_latent_ratio * d_sae
 
-            # compute the prevalence of each neuron
+            sparsity_coefficient = sparsity_schedule(total_step, sparsity_warmup_steps, max_sparsity_coeff)
+            
+            # All logging in one no_grad block
             with torch.no_grad():
+                # Prevalence evaluation and logging
                 if eval_prevalences_every > 0 and total_step % eval_prevalences_every == 0:
                     # use next prevalences_moving_average_batches steps to eval the
                     # prevalences
@@ -488,7 +491,6 @@ with training_ctx:
                     )
                     prevalences_moving_average_averaged += 1
 
-
                     if prevalences_moving_average_averaged >= prevalences_moving_average_batches:
                         evaluating_prevalences = False
                         writer.add_histogram("prevalences", 100. * prevalences_moving_average, total_step,
@@ -497,18 +499,17 @@ with training_ctx:
                         writer.add_histogram("log10 prevalences", torch.log10(prevalences_moving_average + 1e-8), total_step)
                         
                         # Save raw prevalence data asynchronously
-                        prevalences_copy = prevalences_moving_average.detach().float().clone()
+                        prevalences_copy = prevalences_moving_average.float().clone()
                         import threading
                         def save_prevalences():
                             prevalences_cpu = prevalences_copy.cpu().numpy()
                             np.save(f"runs/{run_name}/prevalences/step_{total_step}.npy", prevalences_cpu)
                         threading.Thread(target=save_prevalences, daemon=True).start()
-                        # print(total_step)
 
                         percent_dead = 100. * (prevalences_moving_average < 1e-7).to(dtype).mean()
-                        # Should we need to call .detach().cpu().item()?
                         writer.add_scalar("percent dead", percent_dead, total_step)
 
+                # Feature plotting
                 if plot_features_every > 0 and total_step % plot_features_every == 0:
                     to_plot = 256
                     features = model.dec.weight
@@ -519,44 +520,33 @@ with training_ctx:
                     dot_products = dot_products[idx]
                     dot_products = dot_products[:, idx]
                     dot_products = dot_products / dot_products.max()
-                    dot_products = cmap(dot_products.detach().cpu().numpy())[...,:3]
+                    dot_products = cmap(dot_products.cpu().numpy())[...,:3]
                     dot_products = torch.as_tensor(dot_products).permute(2 ,0 ,1)
                     writer.add_image("dot products", dot_products, total_step)
+
+                # Console metrics printing
+                if total_step % 5000 == 0:
+                    print(f"{total_step=}")
+                    print(f"reconstruction={reconstruction_loss.item()}")
+                    print(f"l0={l0.item()}")
+                    print(f"{sparsity_coefficient=}")
+
+                # TensorBoard scalar logging
+                if steps_per_tensorboard_log > 0 and total_step % steps_per_tensorboard_log == 0:
+                    writer.add_scalar("Reconstruction loss/train", reconstruction_loss, total_step)
+                    writer.add_scalar("L0 loss/train", l0, total_step)
+                    writer.add_scalar("lr", scheduler.get_last_lr()[0], total_step)
+                    writer.add_scalar("sparsity coefficient", sparsity_coefficient, total_step)
 
 
 
 
             
 
-            sparsity_coefficient = sparsity_schedule(total_step, sparsity_warmup_steps, max_sparsity_coeff)
             loss = reconstruction_loss + sparsity_coefficient * l0
             # log losses, compute stats, etc
             grad = loss.backward()
             # norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            # metrics
-            if total_step % 5000 == 0:
-                with torch.no_grad():
-                    # print metrics
-                    print(f"{total_step=}")
-                    print(f"reconstruction={reconstruction_loss.item()}")
-                    print(f"l0={l0.item()}")
-                    # print(f"norm={norm.item()}")
-                    print(f"{sparsity_coefficient=}")
-            if steps_per_tensorboard_log > 0 and total_step % steps_per_tensorboard_log == 0:
-                # Do not use .item() nor .cpu() to avoid GPU-CPU sync during training
-                writer.add_scalar(
-                        "Reconstruction loss/train",
-                        reconstruction_loss,
-                        total_step,)
-                writer.add_scalar("L0 loss/train",
-                        l0,
-                        total_step)
-                writer.add_scalar("lr",
-                        scheduler.get_last_lr()[0],
-                        total_step)
-                writer.add_scalar("sparsity coefficient",
-                        sparsity_coefficient,
-                        total_step)
             optimizer.step()
             # TODO: sparsity_coefficient scheduler
             # print(scheduler.get_last_lr()[0])
