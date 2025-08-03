@@ -177,7 +177,11 @@ class Step(torch.autograd.Function):
         bandwidth = 0.001
         x, threshold = ctx.saved_tensors
         mask = (abs(x - threshold) < bandwidth/2) & (x > 0)
-        grad_threshold = -1.0/bandwidth * mask.to(x.dtype)
+        grad_threshold = torch.where(
+            mask, 
+            -1.0/bandwidth * torch.ones_like(x), 
+            torch.zeros_like(x)
+        )
         return None, grad_threshold * grad_output
 
 class JumpReLU(torch.autograd.Function):
