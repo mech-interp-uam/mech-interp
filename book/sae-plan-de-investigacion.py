@@ -155,6 +155,8 @@ parser.add_argument('--dtype', type=str, default='fp32',
 parser.add_argument('--lower-dtype', type=str, default='fp32',
                     choices=['fp32', 'bf16', 'fp16'], 
                     help='Computation dtype: fp32, bf16, or fp16')
+parser.add_argument('--adam-trick', action='store_true', default=True,
+                    help='Use Adam trick for gradient scaling (default: True)')
 args = parser.parse_args()
 
 # Validate dtype combinations - only allow supported combinations
@@ -208,6 +210,45 @@ x_artificial_std = 1.
 # Input scaling factor: normalize input to have per-entry variance ≈ 1
 # for optimal fp16/fp8 range utilization
 
+w_real_std = w_std
+w_artificial_std = 1.
+
+# intention is to scale before next matmul to preserve input variance
+# c = 1 / sqrt(d_model * weight_per_entry_var)
+# where weight_per_entry_var = (w_artificial_std/w_real_std)^2 * w_std^2
+c = 1.0 / (sqrt(d_model) * (w_artificial_std/w_real_std) * w_std)
+
+# Gradient scaling: make 2*error_vector have per-entry variance ≈ 1
+if args.adam_trick:
+    # Error vector scales linearly by the total scaling factors
+    total_error_linear_scaling = (
+        (x_artificial_std/x_real_std) * 
+        x_real_norm *
+        (w_artificial_std/w_real_std)**2 * 
+        c
+    )
+    # CRITICAL: Account for batch size in gradient computation
+    # Reconstruction loss: ((x - input).pow(2)).mean(0).sum()
+    # The .mean(0) averages over batch dimension, so gradient becomes:
+    # ∇ loss = (2/batch_size) * error_vector, not just 2 * error_vector
+    # 
+    # Target: var(grad_scaler * (2/batch_size) * scaled_error_vector) = 1
+    # 
+    # The actual gradient is: grad_scaler * (2/batch_size) * total_error_linear_scaling * original_error_vector
+    # We want: var(grad_scaler * (2/batch_size) * total_error_linear_scaling * original_error_vector) = 1
+    # Therefore: grad_scaler² * (4/batch_size²) * total_error_linear_scaling² * var(original_error_vector) = 1
+    # 
+    # Solving for grad_scaler:
+    # grad_scaler = batch_size / (2 * total_error_linear_scaling * sqrt(var(original_error_vector)))
+    # 
+    # The interpretable per-entry variance from unscaled training (empirically measured):
+    interpretable_per_entry_var = 0.1 / d_model
+    batch_size = 1024 * 4  # From training loop: batch = 1024 * 4
+    grad_scaler = 1 / (total_error_linear_scaling * sqrt(interpretable_per_entry_var))
+else:
+    raise NotImplementedError("Disabling Adam trick is not implemented. "
+                            "Adam trick is required for gradient scaling to work correctly.")
+
 
 # In[ ]:
 
@@ -223,7 +264,7 @@ def common_fused_forward(ctx, x, threshold):
 def make_backward_function(use_x_for_grad, returns_tuple=False):
     if returns_tuple:
         def backward_fn(ctx, grad_output, grad_mask_unused):
-            bandwidth = 0.001 * (x_artificial_std/x_real_std) * x_real_norm
+            bandwidth = 0.001 * (x_artificial_std/x_real_std) * x_real_norm * (w_artificial_std/w_real_std)
             x, threshold = ctx.saved_tensors
             mask = (abs(x - threshold) < bandwidth/2) & (x > 0)
             
@@ -237,7 +278,7 @@ def make_backward_function(use_x_for_grad, returns_tuple=False):
             return torch.zeros_like(x), grad_threshold * grad_output
     else:
         def backward_fn(ctx, grad_output):
-            bandwidth = 0.001 * (x_artificial_std/x_real_std) * x_real_norm
+            bandwidth = 0.001 * (x_artificial_std/x_real_std) * x_real_norm * (w_artificial_std/w_real_std)
             x, threshold = ctx.saved_tensors
             mask = (abs(x - threshold) < bandwidth/2) & (x > 0)
             
@@ -287,7 +328,7 @@ class Sae(nn.Module):
         self.dec = nn.Linear(d_sae, d_model, dtype=dtype)
         # Create and manipulate tensors in fp32
         w = torch.randn(d_model, d_sae, dtype=torch.float32)
-        w *= ((w_std * sqrt(d_model))/vector_norm(w, dim=0, keepdim=True))
+        w *= (((w_std * sqrt(d_model))*(w_artificial_std/w_real_std))/vector_norm(w, dim=0, keepdim=True))
         with torch.no_grad():
             # normalize each of the d_sae dictionary vectors
             self.dec.weight.copy_(w.clone().to(dtype))
@@ -295,7 +336,11 @@ class Sae(nn.Module):
             self.enc.bias.copy_(torch.zeros_like(self.enc.bias))
             self.dec.bias.copy_(torch.zeros_like(self.dec.bias))
         self.log_threshold = nn.Parameter(
-            torch.log(torch.full((d_sae,), 0.001 * (x_artificial_std/x_real_std) * x_real_norm, dtype=torch.float32)).to(dtype))
+            torch.log(
+                torch.full(
+                    (d_sae,),
+                    0.001 * (x_artificial_std/x_real_std) * x_real_norm * (w_artificial_std/w_real_std),
+                    dtype=torch.float32)).to(dtype))
         self.use_pre_enc_bias = use_pre_enc_bias
         
         # Set activation function (do string comparison once in init)
@@ -313,11 +358,10 @@ class Sae(nn.Module):
         def project_out_parallel_grad(dim, tensor):
             @torch.no_grad
             def hook(grad_in):
-                # norm along dim=dim of the tensor is assumed to be w_std * sqrt(d_model) as we
-                # are going to normalize it after every grad update
-                norm_factor = w_std * sqrt(d_model)
+                # tensor has constant norm w_std * sqrt(d_model) * (w_artificial_std/w_real_std)
+                norm_sq = (w_std * sqrt(d_model) * (w_artificial_std/w_real_std))**2
                 dot = (tensor * grad_in).sum(dim=dim, keepdim=True)
-                return grad_in - dot * tensor / (norm_factor * norm_factor)
+                return grad_in - (dot / norm_sq) * tensor
             return hook
 
         self.dec.weight.register_hook(
@@ -347,6 +391,8 @@ class Sae(nn.Module):
             x = x * s  # Element-wise multiply works with boolean
             d['mask'] = s  # Keep as boolean
         
+        # scale x before the following reduced-precision matmul
+        x *= c
         x = self.dec(x)
         d['reconstruction'] = ((x.float() - original_input.float()).pow(2)).mean(0).sum()
 
@@ -613,9 +659,9 @@ with training_ctx:
             reconstruction_loss, mask = d['reconstruction'], d['mask']
             # Create interpretable loss that undoes the L2^2 scaling effect
             interpretable_reconstructions_loss = reconstruction_loss / (
-                (x_artificial_std/x_real_std)**2 *
-                x_real_norm**2
-            )
+                (x_artificial_std/x_real_std) * x_real_norm
+                *((w_artificial_std/w_real_std)**2*c)
+            )**2
             if mask.dtype == torch.bool:
                 prevalences = mask.float().mean(0)
             else:
@@ -625,7 +671,13 @@ with training_ctx:
 
             sparsity_coefficient = sparsity_schedule(total_step, sparsity_warmup_steps, max_sparsity_coeff)
             
-            (reconstruction_loss + (sparsity_coefficient * x_real_norm) * l0).backward()
+            # Scale L0 loss to match reconstruction path scaling for gradient balance
+            l0_scaling = total_error_linear_scaling * (w_artificial_std/w_real_std) * c
+            loss = reconstruction_loss + (sparsity_coefficient * l0_scaling) * l0
+            # Apply gradient scaling for numerical stability
+            scaled_loss = loss * grad_scaler
+            # log losses, compute stats, etc
+            grad = scaled_loss.backward()
 
             # All logging in one no_grad block
             with torch.no_grad():
@@ -743,7 +795,7 @@ with training_ctx:
 
             # normalize
             with torch.no_grad():
-                model.dec.weight *= ((w_std * sqrt(d_model))/vector_norm(model.dec.weight, dim=0, keepdim=True))
+                model.dec.weight *= ((w_std * sqrt(d_model)*(w_artificial_std/w_real_std))/vector_norm(model.dec.weight, dim=0, keepdim=True))
         # print(f"epoch loss: {loss.detach().item()}")
             
             # Profiler step
