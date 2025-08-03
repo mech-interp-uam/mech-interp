@@ -316,7 +316,7 @@ class Sae(nn.Module):
         x, s = JumpReLU.apply(x, threshold)
         x = self.dec(x)
         d['mask'] = s
-        d['reconstruction'] = ((x - original_input).pow(2)).mean(0).sum()
+        d['reconstruction'] = ((x.float() - original_input.float()).pow(2)).mean(0).sum()
 
         return d
 
