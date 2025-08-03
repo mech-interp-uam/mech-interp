@@ -422,6 +422,8 @@ bin_edges = np.logspace(np.log10(1e-8), np.log10(100), num=101).tolist()
 np.save(f"runs/{run_name}/prevalences/bin_edges.npy", np.array(bin_edges))
 
 plot_features_every = 1000
+log_grads_every = 100
+log_params_every = 500
 
 def heatmap_feature_products(features):
     ...
@@ -471,6 +473,10 @@ with training_ctx:
 
             sparsity_coefficient = sparsity_schedule(total_step, sparsity_warmup_steps, max_sparsity_coeff)
             
+            loss = reconstruction_loss + sparsity_coefficient * l0
+            # log losses, compute stats, etc
+            grad = loss.backward()
+
             # All logging in one no_grad block
             with torch.no_grad():
                 # Prevalence evaluation and logging
@@ -538,14 +544,47 @@ with training_ctx:
                     writer.add_scalar("lr", scheduler.get_last_lr()[0], total_step)
                     writer.add_scalar("sparsity coefficient", sparsity_coefficient, total_step)
 
+                # Gradient logging (after backward pass)
+                if log_grads_every > 0 and total_step % log_grads_every == 0:
+                    # Log threshold gradient statistics
+                    threshold_grad = model.log_threshold.grad
+                    if threshold_grad is not None:
+                        nonzero_threshold_grads = threshold_grad.nonzero().numel()  # nonzero() causes a sync
+                        writer.add_scalar("grad/threshold_nonzero_count", nonzero_threshold_grads, total_step)
+                        writer.add_scalar("grad/threshold_norm", threshold_grad.norm(), total_step)
+                        writer.add_scalar("grad/threshold_mean", threshold_grad.mean(), total_step)
+                        writer.add_histogram("grad/threshold_hist", threshold_grad, total_step)
+                    
+                    # Log encoder/decoder weight gradient norms and histograms
+                    if model.enc.weight.grad is not None:
+                        writer.add_scalar("grad/enc_weight_norm", model.enc.weight.grad.norm(), total_step)
+                        writer.add_histogram("grad/enc_weight_hist", model.enc.weight.grad, total_step)
+                    if model.dec.weight.grad is not None:
+                        writer.add_scalar("grad/dec_weight_norm", model.dec.weight.grad.norm(), total_step)
+                        writer.add_histogram("grad/dec_weight_hist", model.dec.weight.grad, total_step)
+
+                # Parameter logging
+                if log_params_every > 0 and total_step % log_params_every == 0:
+                    # Log threshold parameters
+                    thresholds = torch.exp(model.log_threshold)
+                    writer.add_scalar("params/threshold_mean", thresholds.mean(), total_step)
+                    writer.add_scalar("params/threshold_std", thresholds.std(), total_step)
+                    writer.add_scalar("params/threshold_min", thresholds.min(), total_step)
+                    writer.add_scalar("params/threshold_max", thresholds.max(), total_step)
+                    writer.add_histogram("params/threshold_hist", thresholds, total_step)
+                    
+                    # Log encoder/decoder weight parameters
+                    writer.add_scalar("params/enc_weight_norm", model.enc.weight.norm(), total_step)
+                    writer.add_scalar("params/enc_weight_mean", model.enc.weight.mean(), total_step)
+                    writer.add_scalar("params/enc_weight_std", model.enc.weight.std(), total_step)
+                    writer.add_histogram("params/enc_weight_hist", model.enc.weight, total_step)
+                    
+                    writer.add_scalar("params/dec_weight_norm", model.dec.weight.norm(), total_step)
+                    writer.add_scalar("params/dec_weight_mean", model.dec.weight.mean(), total_step)
+                    writer.add_scalar("params/dec_weight_std", model.dec.weight.std(), total_step)
+                    writer.add_histogram("params/dec_weight_hist", model.dec.weight, total_step)
 
 
-
-            
-
-            loss = reconstruction_loss + sparsity_coefficient * l0
-            # log losses, compute stats, etc
-            grad = loss.backward()
             # norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             # TODO: sparsity_coefficient scheduler
