@@ -180,7 +180,7 @@ class Step(torch.autograd.Function):
         x, threshold = ctx.saved_tensors
         mask = (abs(x - threshold) < bandwidth/2) & (x > 0)
         grad_threshold = -1.0/bandwidth * mask.to(x.dtype)
-        return torch.zeros_like(x), grad_threshold * grad_output
+        return None, grad_threshold * grad_output
 
 
 # In[ ]:
@@ -455,7 +455,9 @@ with training_ctx:
         for step, x in enumerate(tqdm(dataloader)):
             x = x.to(device, non_blocking=True).to(dtype)
             x /= 3.4 # this is supposed to be the expected norm
-            optimizer.zero_grad()
+            # Clear gradients manually instead of optimizer.zero_grad()
+            for param in model.parameters():
+                param.grad = None
             # you can do without the prevalences, use a rolling average for
             # mask that you clean once in a while and sent or do stuff when it
             # has averaged over enough steps
