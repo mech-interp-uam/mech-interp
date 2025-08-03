@@ -113,7 +113,6 @@ import argparse
 # In[ ]:
 
 
-dtype = torch.float32
 device = "cuda" if torch.cuda.is_available() else "cpu"
 # Parse command line arguments
 parser = argparse.ArgumentParser()
@@ -150,7 +149,19 @@ parser.add_argument('--activation-fn', type=str, default='jumprelu',
 parser.add_argument('--optimizer', type=str, default='adam', 
                     choices=['adam', 'rmsprop'],
                     help='Optimizer choice: adam or rmsprop (rmsprop reproduces Adam beta1=0)')
+parser.add_argument('--dtype', type=str, default='fp32', 
+                    choices=['fp32', 'fp16'],
+                    help='Parameter dtype: fp32 or fp16')
+parser.add_argument('--lower-dtype', type=str, default='fp32',
+                    choices=['fp32', 'bf16', 'fp16'], 
+                    help='Computation dtype: fp32, bf16, or fp16')
 args = parser.parse_args()
+
+# Validate dtype combinations
+if args.dtype == 'fp16' and args.lower_dtype not in ['fp16']:
+    raise ValueError("fp16 params only support fp16 lower_dtype")
+if args.lower_dtype == 'fp16' and args.dtype not in ['fp32', 'fp16']:
+    raise ValueError("fp16 lower_dtype requires fp32 or fp16 params")
 
 # Set random seed for reproducibility
 torch.manual_seed(args.seed)
@@ -166,6 +177,16 @@ if args.deterministic:
     torch.use_deterministic_algorithms(True)
 
 USE_PROFILER = True
+
+# Set up dtypes based on CLI arguments
+dtype_map = {
+    'fp32': torch.float32,
+    'fp16': torch.float16,
+    'bf16': torch.bfloat16
+}
+dtype = dtype_map[args.dtype]
+lower_dtype = dtype_map[args.lower_dtype]
+
 d_model = 2048
 d_sae = d_model * args.exp_factor
 w_std = 1/sqrt(d_model) if args.use_d_model_std else 1/sqrt(d_sae)
