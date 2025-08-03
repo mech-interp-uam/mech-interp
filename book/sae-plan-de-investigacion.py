@@ -191,7 +191,7 @@ def make_backward_function(use_x_for_grad, returns_tuple=False):
                 grad_tensor = x
             else:
                 grad_tensor = threshold
-            grad_threshold = (-grad_tensor/bandwidth) * mask.to(x.dtype)
+            grad_threshold = torch.where(mask, -grad_tensor/bandwidth, torch.zeros_like(grad_tensor))
             
             return torch.zeros_like(x), grad_threshold * grad_output
     else:
@@ -205,7 +205,7 @@ def make_backward_function(use_x_for_grad, returns_tuple=False):
                 grad_tensor = x
             else:
                 grad_tensor = threshold
-            grad_threshold = (-grad_tensor/bandwidth) * mask.to(x.dtype)
+            grad_threshold = torch.where(mask, -grad_tensor/bandwidth, torch.zeros_like(grad_tensor))
             
             return torch.zeros_like(x), grad_threshold * grad_output
     return backward_fn
