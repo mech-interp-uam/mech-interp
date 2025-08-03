@@ -480,7 +480,7 @@ with training_ctx:
             # All logging in one no_grad block
             with torch.no_grad():
                 # Prevalence evaluation and logging
-                if eval_prevalences_every > 0 and total_step % eval_prevalences_every == 0:
+                if eval_prevalences_every > 0 and total_step >= 1000 and total_step % eval_prevalences_every == 0:
                     # use next prevalences_moving_average_batches steps to eval the
                     # prevalences
 
