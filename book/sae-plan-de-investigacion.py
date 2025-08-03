@@ -131,7 +131,33 @@ parser.add_argument('--sparsity-warmup-full', action='store_true',
                     help='Use full training length for sparsity warmup instead of 100k steps')
 parser.add_argument('--max-lr', type=float, default=14e-5,
                     help='Maximum learning rate')
+parser.add_argument('--seed', type=int, default=42,
+                    help='Random seed for reproducibility')
+parser.add_argument('--compile-mode', type=str, default='max-autotune', 
+                    choices=['max-autotune', 'default', 'none'],
+                    help='PyTorch compile mode: max-autotune, default, or none')
+parser.add_argument('--early-exit', type=int, default=0,
+                    help='Exit training after N steps (0 = no early exit)')
+parser.add_argument('--log-timing', action='store_true',
+                    help='Log epoch timing to file (logged after each epoch to avoid GPU sync)')
+parser.add_argument('--deterministic', action='store_true',
+                    help='Enable deterministic behavior (may affect performance)')
+parser.add_argument('--no-pre-enc-bias', action='store_true',
+                    help='Disable pre-encoder bias (subtract decoder bias from input)')
 args = parser.parse_args()
+
+# Set random seed for reproducibility
+torch.manual_seed(args.seed)
+np.random.seed(args.seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
+# Set deterministic behavior if requested
+if args.deterministic:
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True)
 
 USE_PROFILER = True
 d_in = 2048
@@ -336,18 +362,20 @@ len(dataloader)
 torch.set_float32_matmul_precision('high')
 steps = 2**16
 max_lr = args.max_lr
-model = Sae(d_in, d_sae)
+model = Sae(d_in, d_sae, use_pre_enc_bias=not args.no_pre_enc_bias)
 model.to(device)
-model.compile(
-        mode="max-autotune",
-        dynamic=False,
-        fullgraph=True,
-#         options = {
-#             "max_autotune":True,
-#             "epilogue_fusion":True,
-#             "triton.cudagraphs":True,
-#             },
-        )
+# Apply compile mode based on CLI argument
+if args.compile_mode != 'none':
+    model.compile(
+            mode=args.compile_mode,
+            dynamic=False,
+            fullgraph=True,
+    #         options = {
+    #             "max_autotune":True,
+    #             "epilogue_fusion":True,
+    #             "triton.cudagraphs":True,
+    #             },
+            )
 warmup_steps=2000
 sparcity_warmup_steps = args.total_steps if args.sparsity_warmup_full else 100000
 total_steps=args.total_steps
@@ -370,6 +398,12 @@ writer = SummaryWriter(f"runs/{run_name}")
 import os
 os.makedirs(f"runs/{run_name}/prevalences", exist_ok=True)
 os.makedirs(f"runs/{run_name}/checkpoints", exist_ok=True)
+os.makedirs(f"runs/{run_name}/prof", exist_ok=True)
+
+# Initialize timing variables
+import time
+epoch_start_time = None
+epoch_number = 0
 
 
 should_break = False
@@ -402,16 +436,20 @@ cmap = plt.get_cmap("viridis")
 
 
 profiler = prof.profile(
-    schedule=prof.schedule(wait=1, warmup=1, active=3, repeat=2),
-    on_trace_ready=prof.tensorboard_trace_handler("runs/prof"),
+    schedule=prof.schedule(wait=10, warmup=5, active=15, repeat=3),
+    on_trace_ready=prof.tensorboard_trace_handler(f"runs/{run_name}/prof"),
     record_shapes=True,
     with_flops=True,
     with_stack=True,
     ) if USE_PROFILER else nullcontext()
 
 training_ctx = profiler if USE_PROFILER else nullcontext()
+
+evaluating_prevalences = False
+
 with training_ctx:
     while total_step < total_steps:
+        epoch_start_time = time.time()
         for step, x in enumerate(tqdm(dataloader)):
             x = x.to(device, non_blocking=True).to(dtype)
             x /= 3.4 # this is supposed to be the expected norm
@@ -545,6 +583,19 @@ with training_ctx:
             if total_step > total_steps:
                 should_break = True
                 break
+            
+            # Early exit if requested
+            if args.early_exit > 0 and total_step >= args.early_exit:
+                print(f"Early exit at step {total_step}")
+                should_break = True
+                break
+        # Log epoch timing if requested
+        if args.log_timing:
+            epoch_duration = time.time() - epoch_start_time
+            with open(f"runs/{run_name}/epoch_timing.txt", "a") as f:
+                f.write(f"Epoch {epoch_number}: {epoch_duration:.3f}s\n")
+            epoch_number += 1
+            
         if should_break:
             break
 
