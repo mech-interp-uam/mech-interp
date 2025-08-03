@@ -144,6 +144,9 @@ parser.add_argument('--deterministic', action='store_true',
                     help='Enable deterministic behavior (may affect performance)')
 parser.add_argument('--no-pre-enc-bias', action='store_true',
                     help='Disable pre-encoder bias (subtract decoder bias from input)')
+parser.add_argument('--activation-fn', type=str, default='jumprelu',
+                    choices=['jumprelu', 'step', 'fusedstep'],
+                    help='Activation function: jumprelu (literature), step (separate), fusedstep (true fusion)')
 args = parser.parse_args()
 
 # Set random seed for reproducibility
@@ -168,26 +171,76 @@ w_std = 1/sqrt(d_model) if args.use_d_model_std else 1/sqrt(d_sae)
 # In[ ]:
 
 
+# Common forward function for fused operations
+def common_fused_forward(ctx, x, threshold):
+    mask_x = x > threshold
+    out = torch.where(mask_x, x, torch.zeros((), dtype=x.dtype, device=x.device))
+    ctx.save_for_backward(x, threshold)
+    return out, mask_x
+
+# Closure to create backward functions with pre-selected gradient tensor
+def make_backward_function(use_x_for_grad, returns_tuple=False):
+    if returns_tuple:
+        def backward_fn(ctx, grad_output, grad_mask_unused):
+            bandwidth = 0.001
+            x, threshold = ctx.saved_tensors
+            mask = (abs(x - threshold) < bandwidth/2) & (x > 0)
+            
+            # Pre-select which tensor to use for gradient (no conditional during execution)
+            if use_x_for_grad:
+                grad_tensor = x
+            else:
+                grad_tensor = threshold
+            grad_threshold = (-grad_tensor/bandwidth) * mask.to(x.dtype)
+            
+            return torch.zeros_like(x), grad_threshold * grad_output
+    else:
+        def backward_fn(ctx, grad_output):
+            bandwidth = 0.001
+            x, threshold = ctx.saved_tensors
+            mask = (abs(x - threshold) < bandwidth/2) & (x > 0)
+            
+            # Pre-select which tensor to use for gradient (no conditional during execution)
+            if use_x_for_grad:
+                grad_tensor = x
+            else:
+                grad_tensor = threshold
+            grad_threshold = (-grad_tensor/bandwidth) * mask.to(x.dtype)
+            
+            return torch.zeros_like(x), grad_threshold * grad_output
+    return backward_fn
+
+# Step function (separate operations) 
 class Step(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, threshold):
         ctx.save_for_backward(x, threshold)
         return (x > threshold).to(x.dtype)
 
+    backward = staticmethod(make_backward_function(use_x_for_grad=False, returns_tuple=False))  # Uses -threshold
+
+# JumpReLU (literature-aligned, uses -threshold)
+class JumpReLU(torch.autograd.Function):
     @staticmethod
-    def backward(ctx, grad_output):
-        bandwidth = 0.001
-        x, threshold = ctx.saved_tensors
-        mask = (abs(x - threshold) < bandwidth/2) & (x > 0)
-        grad_threshold = -1.0/bandwidth * mask.to(x.dtype)
-        return None, grad_threshold * grad_output
+    def forward(ctx, x, threshold):
+        return common_fused_forward(ctx, x, threshold)
+
+    backward = staticmethod(make_backward_function(use_x_for_grad=False, returns_tuple=True))  # Uses -threshold
+
+# FusedStep (true fusion, uses -x)  
+class FusedStep(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, threshold):
+        return common_fused_forward(ctx, x, threshold)
+
+    backward = staticmethod(make_backward_function(use_x_for_grad=True, returns_tuple=True))   # Uses -x
 
 
 # In[ ]:
 
 
 class Sae(nn.Module):
-    def __init__(self, d_model, d_sae, use_pre_enc_bias=True, **kwargs):
+    def __init__(self, d_model, d_sae, use_pre_enc_bias=True, activation_fn='jumprelu', **kwargs):
         super().__init__(**kwargs)
         self.enc = nn.Linear(d_model, d_sae, dtype=dtype)
         self.dec = nn.Linear(d_sae, d_model, dtype=dtype)
@@ -202,6 +255,19 @@ class Sae(nn.Module):
         self.log_threshold = nn.Parameter(
             torch.log(torch.full((d_sae,), 0.001, dtype=dtype)))
         self.use_pre_enc_bias = use_pre_enc_bias
+        
+        # Set activation function (do string comparison once in init)
+        if activation_fn == 'step':
+            self.activation_fn = Step.apply
+            self.returns_tuple = False
+        elif activation_fn == 'jumprelu':
+            self.activation_fn = JumpReLU.apply
+            self.returns_tuple = True
+        elif activation_fn == 'fusedstep':
+            self.activation_fn = FusedStep.apply
+            self.returns_tuple = True
+        else:
+            raise ValueError(f"Unknown activation function: {activation_fn}")
         def project_out_parallel_grad(dim, tensor):
             @torch.no_grad
             def hook(grad_in):
@@ -229,10 +295,17 @@ class Sae(nn.Module):
         
         x = self.enc(x)
         threshold = torch.exp(self.log_threshold)
-        s = Step.apply(x, threshold)
-        x = x*s
+        
+        # Apply pre-selected activation function
+        if self.returns_tuple:
+            x, s = self.activation_fn(x, threshold)
+            d['mask'] = s  # Keep as boolean
+        else:
+            s = self.activation_fn(x, threshold)
+            x = x * s  # Element-wise multiply works with boolean
+            d['mask'] = s  # Keep as boolean
+        
         x = self.dec(x)
-        d['mask'] = s
         d['reconstruction'] = ((x - original_input).pow(2)).mean(0).sum()
 
         return d
@@ -362,7 +435,7 @@ len(dataloader)
 torch.set_float32_matmul_precision('high')
 steps = 2**16
 max_lr = args.max_lr
-model = Sae(d_model, d_sae, use_pre_enc_bias=not args.no_pre_enc_bias)
+model = Sae(d_model, d_sae, use_pre_enc_bias=not args.no_pre_enc_bias, activation_fn=args.activation_fn)
 model.to(device)
 # Apply compile mode based on CLI argument
 if args.compile_mode != 'none':
@@ -469,7 +542,10 @@ with training_ctx:
                         # return_l0=False,
                         )
             reconstruction_loss, mask = d['reconstruction'], d['mask']
-            prevalences = mask.mean(0)
+            if mask.dtype == torch.bool:
+                prevalences = mask.float().mean(0)
+            else:
+                prevalences = mask.mean(0)
             l0 = prevalences.sum()
             # l0 = active_latent_ratio * d_sae
 
@@ -643,7 +719,7 @@ torch.save(model.state_dict(), f"models/sae_{run_name}.pth")
 # In[ ]:
 
 
-sae2 = Sae(d_model, d_sae)
+sae2 = Sae(d_model, d_sae, use_pre_enc_bias=not args.no_pre_enc_bias, activation_fn=args.activation_fn)
 sae2.load_state_dict(model.state_dict())
 
 
