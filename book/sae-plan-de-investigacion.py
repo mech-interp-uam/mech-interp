@@ -200,6 +200,7 @@ else:
 d_model = 2048
 d_sae = d_model * args.exp_factor
 w_std = 1/sqrt(d_model) if args.use_d_model_std else 1/sqrt(d_sae)
+batch = 1024 * 4
 
 # these are measured from the data
 x_real_norm = 3.4
@@ -230,21 +231,19 @@ if args.adam_trick:
     # CRITICAL: Account for batch size in gradient computation
     # Reconstruction loss: ((x - input).pow(2)).mean(0).sum()
     # The .mean(0) averages over batch dimension, so gradient becomes:
-    # ∇ loss = (2/batch_size) * error_vector, not just 2 * error_vector
-    # 
+    # ∇ loss = (2/batch_size) * scaled_error_vector, not just 2 * error_vector
+    # where scaled_error_vector is about the unscaled error_vector times
+    # the scale at the err poit of the forward: total_error_linear_scaling
+    #
     # Target: var(grad_scaler * (2/batch_size) * scaled_error_vector) = 1
-    # 
-    # The actual gradient is: grad_scaler * (2/batch_size) * total_error_linear_scaling * original_error_vector
-    # We want: var(grad_scaler * (2/batch_size) * total_error_linear_scaling * original_error_vector) = 1
-    # Therefore: grad_scaler² * (4/batch_size²) * total_error_linear_scaling² * var(original_error_vector) = 1
-    # 
-    # Solving for grad_scaler:
-    # grad_scaler = batch_size / (2 * total_error_linear_scaling * sqrt(var(original_error_vector)))
-    # 
+
     # The interpretable per-entry variance from unscaled training (empirically measured):
     interpretable_per_entry_var = 0.1 / d_model
-    batch_size = 1024 * 4  # From training loop: batch = 1024 * 4
-    grad_scaler = 1 / (total_error_linear_scaling * sqrt(interpretable_per_entry_var))
+    grad_scaler = batch / (
+        2 *
+        total_error_linear_scaling *
+        sqrt(interpretable_per_entry_var)
+    )
 else:
     raise NotImplementedError("Disabling Adam trick is not implemented. "
                             "Adam trick is required for gradient scaling to work correctly.")
@@ -497,7 +496,6 @@ class ActivationsDataset(Dataset):
 # In[ ]:
 
 
-batch = 1024 * 4
 dataset = ActivationsDataset(ds['train'])
 dataloader = DataLoader(
     dataset,
