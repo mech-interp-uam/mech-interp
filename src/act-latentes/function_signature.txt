@@ -1,0 +1,55 @@
+from typing import Iterable, Tuple, Dict, Union
+from datasets import Dataset
+from transformers import AutoTokenizer
+import numpy as np
+import torch
+from jaxtyping import Float, Int, Array
+
+
+
+# Función de codificación por lotes, esta funnción aplica un encoder con los pesos y sesgos dados
+def encode_batch(
+    x: Float[Array, "b d_model"],
+    W_enc_param: Float[Array, "d_sae d_model"],
+    bias_total_param: Float[Array, "d_sae"],
+) -> Float[Array, "b d_sae"]: ...
+
+
+# Función para recolectar estadísticas y top-k activaciones
+
+def collect_stats_and_topk(
+    dataset: Iterable[dict],
+    k: int = TOP_K,
+    batch_size: int = BATCH_SIZE,
+    W_ENC_param: Float[Array, "d_sae d_model"] = W_ENC,
+    BIAS_TOTAL_param: Float[Array, "d_sae"] = BIAS_TOTAL,
+    TAU_param: Float[Array, "d_sae"] = TAU,
+    exp_norm_param: float = EXP_NORM,
+) -> tuple[
+    Int[Array, "d_sae"],
+    Int[Array, "d_sae k"],
+    Float[Array, "d_sae k"],
+]: ...
+
+
+unciones para explicar neuronas usando OpenAI
+
+def create_prompt(
+    nid: int,
+    acts_idx: np.ndarray,
+    acts_val: np.ndarray,
+    raw_dataset: Dataset,
+    tokenizer_param: AutoTokenizer,
+    doc_map: dict[int, list[int]],
+) -> tuple[str, str]: ...
+
+# Función principal para explicar una neurona con manejo de errores
+
+def explain_neuron_robust(
+    nid: int,
+    idx: np.ndarray,
+    val: np.ndarray,
+    raw_dataset: Dataset,
+    tokenizer_param: AutoTokenizer,
+    doc_map: dict[int, list[int]],
+) -> dict[str, str] | str: ...
