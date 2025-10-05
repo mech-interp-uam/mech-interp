@@ -6,6 +6,7 @@ root: intro
 chapters:
 - file: introduccion
 - file: autoencoder-simple
+- file: teorema_aprox.ipynb
 - file: Transformers
 - file: sae-plan-de-investigacion
 - file: expli_llama
