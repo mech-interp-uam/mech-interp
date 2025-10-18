@@ -9,6 +9,7 @@ chapters:
 - file: teorema_aprox.ipynb
 - file: Transformers
 - file: sae-plan-de-investigacion
+- file: activacion-latentes
 - file: expli_llama
 - file: tuto-scrip
 - file: extraer_mlp8_hf
