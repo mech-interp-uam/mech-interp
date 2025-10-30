@@ -1,16 +1,15 @@
-# Table of contents
-# Learn more at https://jupyterbook.org/customize/toc.html
 
 format: jb-book
-root: intro
-chapters:
-- file: introduccion
-- file: autoencoder-simple
-- file: teorema_aprox.ipynb
-- file: Transformers
-- file: sae-plan-de-investigacion
-- file: activacion-latentes
-- file: expli_llama
-- file: tuto-scrip
-- file: extraer_mlp8_hf
-
+root: portada 
+parts:
+  - caption: "Contenido principal"
+    chapters:
+      - file: introduccion
+      - file: teorema_aprox.ipynb
+      - file: autoencoder-simple
+      - file: Transformers
+      - file: sae-plan-de-investigacion
+      - file: activacion-latentes
+      - file: expli_llama
+      - file: tuto-scrip
+      - file: extraer_mlp8_hf
