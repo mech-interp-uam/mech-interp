@@ -1,5 +1,4 @@
-
-<p align="center">
-  <img src="Portada_proyecto.png" width="80%">
-</p>
-
+```{image} ./Portada_proyecto.png
+:width: 80%
+:align: center
+```
