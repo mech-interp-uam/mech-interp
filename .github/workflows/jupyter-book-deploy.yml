@@ -26,10 +26,10 @@ jobs:
     permissions:
       pages: write
       id-token: write
+
     steps:
       - uses: actions/checkout@v4
 
-      # Install dependencies
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
@@ -37,27 +37,31 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r book/requirements.txt
+        run: |
+          pip install -r book/requirements.txt
+          pip install jupyter-book   # ✅ añadido: asegura que jupyter-book esté disponible aunque no esté en requirements.txt
 
-      # (Optional) Cache your executed notebooks between runs
       - name: cache executed notebooks
         uses: actions/cache@v4
         with:
           path: book/_build/.jupyter_cache
           key: jupyter-book-cache-${{ hashFiles('book/requirements.txt') }}
 
-      # Build the book
       - name: Build the book
         run: |
-          jupyter-book build book
+          set -e                                  # ✅ añadido: detiene el flujo si hay un error
+          cd book                                 # ✅ añadido: entra al directorio donde está el libro
+          jupyter-book build . --all --verbose    # ✅ añadido: modo detallado para ver posibles errores de compilación
+          echo "Listing build output:"            # ✅ añadido: muestra el contenido de la carpeta _build
+          ls -la _build || true                   # ✅ añadido: lista archivos generados para verificar el build
+          ls -la _build/html || true              # ✅ añadido: confirma que exista la carpeta HTML
+          cd ..                                   # ✅ añadido: vuelve a la raíz antes de subir artefactos
 
-      # Upload the book's HTML as an artifact
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: "book/_build/html"
+          path: ./book/_build/html   # ✅ modificado: ruta explícita y correcta del build HTML
 
-      # Deploy to GitHub Pages only on push events
       - name: Deploy to GitHub Pages
         if: github.event_name == 'push'
         id: deployment
