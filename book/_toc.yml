@@ -4,9 +4,10 @@ root: portada
 parts:
   - caption: "Contenido principal"
     chapters:
+      - file: intro
       - file: introduccion
-      - file: teorema_aprox.ipynb
       - file: autoencoder-simple
+      - file: teorema_aprox.ipynb
       - file: Transformers
       - file: sae-plan-de-investigacion
       - file: activacion-latentes
