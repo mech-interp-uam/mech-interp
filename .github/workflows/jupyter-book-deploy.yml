@@ -51,7 +51,7 @@ jobs:
         run: |
           set -e                                  # ✅ añadido: detiene el flujo si hay un error
           cd book                                 # ✅ añadido: entra al directorio donde está el libro
-          jupyter-book build . --all --verbose    # ✅ añadido: modo detallado para ver posibles errores de compilación
+          jupyter-book build . --all     # ✅ añadido: modo detallado para ver posibles errores de compilación
           echo "Listing build output:"            # ✅ añadido: muestra el contenido de la carpeta _build
           ls -la _build || true                   # ✅ añadido: lista archivos generados para verificar el build
           ls -la _build/html || true              # ✅ añadido: confirma que exista la carpeta HTML
