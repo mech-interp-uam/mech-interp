@@ -7,7 +7,7 @@ parts:
       - file: intro
       - file: introduccion
       - file: autoencoder-simple
-      - file: teorema_aprox.ipynb
+      - file: teorema_aprox
       - file: Transformers
       - file: sae-plan-de-investigacion
       - file: activacion-latentes
