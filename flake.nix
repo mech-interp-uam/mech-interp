@@ -20,6 +20,14 @@
           pip
           ghp-import
           notebook
+          torch
+          datasets
+          transformers
+          huggingface-hub
+          tqdm
+          openai
+          python-dotenv
+          jaxtyping
         ]))
       ];
     };
