@@ -16,7 +16,7 @@ de lenguaje.
 Comenzamos revisando los perceptrones y las primeras redes feedforward,
 para después introducir arquitecturas más complejas. A lo largo de este 
 recorrido, pusimos especial atención en los Autoencoders Dispersos (Sparse
-Autoencoders), que permiten proyectar las activaciones internas hacia
+Autoencoders, SAE), que permiten proyectar las activaciones internas hacia
 representaciones dispersas y, por lo tanto, más interpretables.
 
 Posteriormente, abordamos el Transformer, una arquitectura que marcó 
